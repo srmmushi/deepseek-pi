@@ -1,7 +1,7 @@
 // DeepSeek 网页版 REST 客户端 —— 原始 API 调用层
 //
-// 与 ds-free-api 的 ds_core/accounts/client.rs 一一对应，关键差异：
-//   - 走 Node 内置 fetch，不再单独起 Python/Rust 服务；
+// 对应上游参考实现的账户 / HTTP 客户端层，关键差异：
+//   - 走 Node 内置 fetch，不再单独起后端服务；
 //   - 所有请求都伪造浏览器头（UA / Origin / Referer），UA 来自登录会话；
 //   - 可选用 undici ProxyAgent 走代理，绕过 CloudFront WAF 的地区限制。
 import type { AppConfig } from "../config/store.js";

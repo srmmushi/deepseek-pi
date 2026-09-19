@@ -2,7 +2,7 @@
 //
 // 两种会话策略：
 //   A. 复用（handle 传入）：pi 会话与网页会话 1:1，只发增量，上下文由服务端维护。
-//   B. 一次性（不传 handle）：每轮新建会话、用完即删，prompt 自带完整历史（ds-free-api 风格）。
+//   B. 一次性（不传 handle）：每轮新建会话、用完即删，prompt 自带完整历史（上游 API 风格）。
 import type { DeepSeekClient, CompletionPayload } from "./client.js";
 import { POW_TARGET } from "./client.js";
 import { encodePowHeader, type PowSolver } from "./pow.js";

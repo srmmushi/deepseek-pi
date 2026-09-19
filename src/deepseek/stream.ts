@@ -1,6 +1,6 @@
 // SSE 流解析 —— 把 DeepSeek 的 p/o/v patch 协议转换为结构化事件
 //
-// 该实现严格对齐 ds-free-api 的 ds_core/src/chat/response.rs：
+// 该实现严格对齐上游参考实现的流式响应解析：
 //   - p / o 跨事件持久化；o 默认 SET；
 //   - BATCH 递归分解，子路径前置父路径；
 //   - 通过 fragments 的 type 区分 THINK 与 RESPONSE；

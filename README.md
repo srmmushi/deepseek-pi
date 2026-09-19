@@ -1,6 +1,6 @@
 # pi-deepseek-web
 
-融合 [pi](https://github.com/earendil-works/pi)（Pi Agent 终端版）与 [ds-free-api](https://github.com/NIyueeE/ds-free-api)（DeepSeek 网页版逆向 API）的能力、重写而成的**精简版 Pi Agent**：
+融合 [pi](https://github.com/earendil-works/pi)（Pi Agent 终端版）与 [deepseek-reverse-api](https://github.com/Wu-jiyan/deepseek-reverse-api)（DeepSeek 网页端逆向 API）的能力、重写而成的**精简版 Pi Agent**：
 
 - **只有一个供应商**：DeepSeek 网页版（`chat.deepseek.com`），启动即用，无需选择。
 - **`/login` 自动抓 token**：拉起可见浏览器 → 用户正常登录 → 自动从 LocalStorage 读取凭证 → 加密落盘，**全程不需要打开 DevTools 复制任何东西**。
@@ -77,21 +77,21 @@ Pi-DeepSeek-Web/
 
 - [pi](https://github.com/earendil-works/pi)（Pi Agent 终端版）：借鉴其 Agent 循环、工具抽象与系统提示词组织方式。
   多供应商抽象与自研 TUI 未采用，改为内置单一供应商 + 自研行编辑器与底部状态栏。
-- [ds-free-api](https://github.com/NIyueeE/ds-free-api)（DeepSeek 网页版逆向 API，Rust）：
-  其 `ds_core` 的调用链（PoW 求解、SSE patch 状态机、原生 ChatML 提示词、伪造请求头）
-  已完整移植到 `src/deepseek/*`，本仓库不需要编译 Rust 二进制。
+- [deepseek-reverse-api](https://github.com/Wu-jiyan/deepseek-reverse-api)（DeepSeek 网页端逆向 API，Python，OpenAI 兼容）：
+  其调用链 —— PoW 挑战求解、SSE 增量（patch）解析、原生 ChatML 提示词组织、浏览器请求头伪造 ——
+  已用 TypeScript 重新实现于 `src/deepseek/*`，因此本仓库**不需要再单独部署 Python 服务**。
 
 ### 关键文件职责
 
-| 文件 | 对应 ds-free-api 的实现 | 职责 |
-|------|------------------------|------|
-| `src/auth/login.ts` | （新增，替代账号密码登录） | 可见浏览器登录 + LocalStorage 抓 `userToken` |
-| `src/auth/crypto.ts` | （新增） | 机器标识派生密钥的 AES-256-GCM 加密 |
-| `src/deepseek/client.ts` | `ds_core/src/accounts/client.rs` | REST 端点 + 伪造浏览器头 |
-| `src/deepseek/pow.ts` | `ds_core/src/accounts/pow.rs` | WASM PoW（`DeepSeekHashV1`） |
-| `src/deepseek/stream.ts` | `ds_core/src/chat/response.rs` | SSE patch 状态机 |
-| `src/deepseek/prompt.ts` | `src/openai_adapter/request/prompt.rs` | DeepSeek 原生标签提示词 |
-| `src/deepseek/provider.ts` | `ds_core/src/chat/request.rs` | 一次 completion 的完整生命周期 |
+| 文件 | 对应上游能力 | 职责 |
+|------|-------------|------|
+| `src/auth/login.ts` | 新增（替代账号密码登录） | 可见浏览器登录 + LocalStorage 抓 `userToken` |
+| `src/auth/crypto.ts` | 新增 | 机器标识派生密钥的 AES-256-GCM 加密 |
+| `src/deepseek/client.ts` | 账户 / HTTP 客户端层 | REST 端点 + 伪造浏览器头 |
+| `src/deepseek/pow.ts` | PoW 求解器 | WASM PoW（`DeepSeekHashV1`） |
+| `src/deepseek/stream.ts` | 流式响应解析 | SSE patch 状态机 |
+| `src/deepseek/prompt.ts` | 请求提示词构建 | DeepSeek 原生标签提示词 |
+| `src/deepseek/provider.ts` | 对话编排 | 一次 completion 的完整生命周期 |
 | `src/agent/loop.ts` | `packages/agent/src/agent-loop.ts`（精简） | Agent 主循环 |
 | `src/agent/repl.ts` | `packages/coding-agent/src/modes/interactive`（精简） | 交互式界面 |
 | `src/agent/session-store.ts` | `packages/coding-agent/src/core/agent-session.ts`（精简） | 会话持久化 + 与网页会话 1:1 绑定 |
@@ -267,7 +267,7 @@ $env:PI_UI = "plain"   # 关闭固定状态栏与面板
 - 工具执行结果作为下一条消息回灌，前缀为 `[工具结果]`；
 - 好处：token 消耗从 O(轮数²) 降到 O(轮数)，且网页端能看到与终端一致的完整对话。
 
-> `contextMode: "replay"` 是兜底方案：每轮把完整历史重新拼成 DeepSeek 原生 ChatML prompt，发到**一次性会话**里用完即删（即 `ds-free-api` 的做法）。它最稳，但 token 消耗随轮数平方增长，且**不满足 1:1 绑定**（网页端只会看到一堆临时会话）。只有在 `reuse` 模式遇到上游行为异常时才切过去。
+> `contextMode: "replay"` 是兜底方案：每轮把完整历史重新拼成 DeepSeek 原生 ChatML prompt，发到**一次性会话**里用完即删（即上游 API 服务的做法）。它最稳，但 token 消耗随轮数平方增长，且**不满足 1:1 绑定**（网页端只会看到一堆临时会话）。只有在 `reuse` 模式遇到上游行为异常时才切过去。
 
 ---
 
@@ -300,10 +300,10 @@ search:关键词
 
 **相对 `pi` 移除的依赖（及其能力）：**
 
-- `@earendil-works/*`（`pi-ai` / `pi-agent-core` / `pi-tui` / `chord` 等）——多供应商抽象与自研 TUI 全部去掉，改为内置单供应商 + readline。
+- `@earendil-works/*`（`pi-ai` / `pi-agent-core` / `pi-tui` / `chord` 等）——多供应商抽象与自研 TUI 全部去掉，改为内置单供应商 + 自研行编辑器与底部状态栏。
 - `photon-node`、`grok-mermaid`、`highlight.js`、`typebox`、`proper-lockfile`、`semver`、`yaml`、`diff`、`minimatch`、`ignore`、`hosted-git-info`、`cross-spawn`、`chalk`、`jiti` —— 图像处理、Mermaid 渲染、代码高亮、JSON Schema 校验、包管理、云同步/遥测等非核心能力全部去掉；配色改为内置 ANSI 实现。
 
-**相对 `ds-free-api` 移除的运行形态：** 不再编译 Rust 二进制、不再需要 `config.toml` / `Cargo.toml` / Web 管理面板，DeepSeek 调用逻辑以 TS 模块内嵌。
+**相对 `deepseek-reverse-api` 移除的运行形态：** 不再需要单独部署 Python 服务、它的配置文件与 Web 管理面板，DeepSeek 调用逻辑以 TS 模块内嵌在同一个进程里。
 
 ---
 
@@ -350,9 +350,9 @@ DeepSeek 编排 (src/deepseek/provider.ts)
 
 ### 风险
 
-1. **TLS 指纹不等于真实浏览器**：`ds-free-api` 使用 BoringSSL 模拟 Chrome 136 的 TLS 指纹，而 Node 的 `fetch`（undici）无法做到。若上游风控收紧到 TLS 层，请求可能被拒。**缓解**：配置非美国地区的 HTTP 代理（`config.json` 的 `proxy`），并保持保守的 `requestIntervalMs`。
+1. **TLS 指纹不等于真实浏览器**：上游参考实现做了浏览器 TLS 指纹模拟（这是它能稳定绕过 WAF 的关键之一），而 Node 的 `fetch`（undici）无法做到。若上游风控收紧到 TLS 层，请求可能被拒。**缓解**：配置非美国地区的 HTTP 代理（`config.json` 的 `proxy`），并保持保守的 `requestIntervalMs`。
 2. **WASM PoW 地址会变**：`wasmUrl` 中的 hash 由上游静态资源版本决定，上游发版后可能失效。**缓解**：报错信息会明确提示更新 `wasmUrl`；未硬编码 `__wbindgen_export_0`，而是按名称动态探测导出。
-3. **JS 无法按函数签名筛选 WASM 导出**：Rust 版可依赖签名匹配，TS 版只能按名称探测，并在失败时退化到「除已知符号外唯一函数」策略，兼容性略低于原实现。
+3. **JS 无法按函数签名筛选 WASM 导出**：上游实现所用的 WASM 运行时可以按函数签名匹配导出，而 JS 的 `WebAssembly` API 只能按名称探测；本实现退化为「按名称 + 除已知符号外唯一函数」策略，兼容性略低于上游，但仍是动态探测、不硬编码符号名。
 4. **网页版接口属非公开接口**：字段（`fragments`、`p/o/v`、`biz_code`）随时可能变更，本项目对已知错误码做了中文提示，但无法覆盖全部情况。
 5. **账号风控**：DeepSeek 对网页端有 session 级限流，累计请求过多可能被临时禁言。**缓解**：默认 1200ms 间隔 + 流式请求失败指数退避重试；建议个人低频使用。
 6. **`exec` 工具可执行任意命令**：与所有编码 Agent 相同，仅在可信目录使用。
@@ -377,10 +377,10 @@ DeepSeek 编排 (src/deepseek/provider.ts)
 
 - **会话复用**：改用 `edit_message` + 复用 `chat_session_id`，减少往返并利用服务端上下文缓存。
 - **自动发现 `wasmUrl`**：抓取 `chat.deepseek.com` 首页 JS，正则提取最新的 `sha3_wasm_bg.*.wasm`，免去手改配置。
-- **增量历史压缩**：目前每轮重发完整 `<｜User｜>/<｜Assistant｜>` 历史，超长时可用 `ds-free-api` 的「历史文件上传」回退策略分块。
+- **增量历史压缩**：`reuse` 模式已把上下文交给服务端；`replay` 回退时可参考上游的「历史文件上传」策略分块。
 - **更强的 TLS 拟真**：接入支持 TLS 指纹自定义的 HTTP 客户端（如 `curl-impersonate` 包装）。
 - **工具扩展**：当前严格保留 5 个核心工具；如需 `edit`（局部替换）可基于 `write` + diff 实现。
-- **多账号轮转**：`ds-free-api` 的账号池能力未移植（单用户单账号场景下无必要）。
+- **多账号轮转**：上游的账号池能力未移植（单用户单账号场景下无必要）。
 - **流式工具调用的增量解析**：目前等整段回答结束再解析工具调用；可在流式过程中提前识别并打断，降低延迟。
 
 ---

@@ -1,6 +1,6 @@
 // DeepSeek 原生 ChatML 提示词构建
 //
-// 对齐 ds-free-api 的 openai_adapter/request/prompt.rs：
+// 对齐上游参考实现的请求提示词构建：
 //   - 角色标记使用全角竖线 <｜Role｜>；
 //   - user 轮次前置 <｜end▁of▁sentence｜>；
 //   - 工具结果用 <｜tool▁outputs▁begin｜> / <｜tool▁output▁begin｜> 包裹；

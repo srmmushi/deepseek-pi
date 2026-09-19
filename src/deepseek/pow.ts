@@ -1,6 +1,6 @@
 // PoW 求解器 —— 基于 DeepSeek 官方 sha3 WASM 的 DeepSeekHashV1
 //
-// 与 ds-free-api 的 Rust 实现等价：从 WASM 中动态探测 wasm-bindgen 导出符号，
+// 与上游参考实现的 PoW 求解器等价：从 WASM 中动态探测 wasm-bindgen 导出符号，
 // 调用 wasm_solve 得到答案，再以 base64(JSON) 形式放进 X-Ds-Pow-Response 头。
 //
 // 注意：JS 无法像 wasmtime 那样按函数签名筛选导出，因此这里按「导出名」探测，
