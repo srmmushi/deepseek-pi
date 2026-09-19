@@ -1,0 +1,14 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+.env
+
+# ── src/pi（pi 上游 monorepo，作为参考实现保留）──
+src/pi/.pi/
+src/pi/**/dist/
+src/pi/**/*.tsbuildinfo
+src/pi/**/.vitest/
+
+# ── src/ds-free-api（Rust 参考实现，DeepSeek 调用逻辑已移植到 src/deepseek）──
+src/ds-free-api/target/

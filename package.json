@@ -1,0 +1,37 @@
+{
+	"name": "pi-deepseek-web",
+	"version": "0.0.1-alpha",
+	"description": "精简版 Pi Agent，仅保留 DeepSeek 网页版（chat.deepseek.com）单一供应商，内置 Playwright 自动登录抓取 token。",
+	"type": "module",
+	"private": true,
+	"bin": {
+		"pi-deepseek-web": "dist/index.js"
+	},
+	"main": "dist/index.js",
+	"files": [
+		"dist",
+		"README.md"
+	],
+	"scripts": {
+		"build": "tsc -p tsconfig.json",
+		"dev": "tsx src/index.ts",
+		"start": "node dist/index.js",
+		"typecheck": "tsc -p tsconfig.json --noEmit",
+		"login": "tsx src/index.ts /login",
+		"pi:install": "npm --prefix src/pi install",
+		"pi:build": "npm --prefix src/pi run build",
+		"pi:check": "npm --prefix src/pi run check"
+	},
+	"engines": {
+		"node": ">=20.10.0"
+	},
+	"dependencies": {
+		"playwright": "^1.49.0",
+		"undici": "^7.2.0"
+	},
+	"devDependencies": {
+		"@types/node": "^22.10.0",
+		"tsx": "^4.19.0",
+		"typescript": "^5.7.0"
+	}
+}
