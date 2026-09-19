@@ -1,6 +1,6 @@
 # pi-deepseek-web
 
-把 [`pi`](./pi)（Pi Agent 终端版）与 [`ds-free-api`](./ds-free-api)（DeepSeek 网页版逆向 API）融合后的**精简版 Pi Agent**：
+融合 [pi](https://github.com/earendil-works/pi)（Pi Agent 终端版）与 [ds-free-api](https://github.com/NIyueeE/ds-free-api)（DeepSeek 网页版逆向 API）的能力、重写而成的**精简版 Pi Agent**：
 
 - **只有一个供应商**：DeepSeek 网页版（`chat.deepseek.com`），启动即用，无需选择。
 - **`/login` 自动抓 token**：拉起可见浏览器 → 用户正常登录 → 自动从 LocalStorage 读取凭证 → 加密落盘，**全程不需要打开 DevTools 复制任何东西**。
@@ -60,29 +60,26 @@ Pi-DeepSeek-Web/
 │   │   └── repl.ts              # 交互式 REPL（流式渲染 / 状态栏 / 快捷键）
 │   │
 │   ├── ui/
-│   │   └── output.ts            # ANSI 配色与输出原语
+│   │   ├── banner.ts            # ASCII 字形
+│   │   ├── line-editor.ts       # 自研单行编辑器（替代 node:readline）
+│   │   ├── output.ts            # ANSI 配色与输出原语
+│   │   ├── palette.ts           # 命令面板 / 补全提示
+│   │   ├── statusbar.ts         # 固定底部状态栏（滚动区域）
+│   │   └── text.ts              # 显示宽度对齐（CJK / ANSI 感知）
 │   │
-│   ├── pi/                      # ← pi 上游 monorepo 的完整功能代码（12 个包，原样保留）
-│   │   ├── packages/{agent,ai,chord,client,coding-agent,durable,evals,
-│   │   │              protocol,server,session-backends,telemetry,tui}
-│   │   ├── scripts/  tsconfig.base.json  biome.json  package.json  …
-│   │   └── .git/                # 上游 git 历史（原 pi 仓库）
-│   │
-│   └── ds-free-api/             # ← ds-free-api 参考实现（Rust + React 面板）
-│
 └── （构建输出）
     └── dist/                    # npm run build 产物
 ```
 
-### 关于 `src/pi` 与 `src/ds-free-api`
+### 与上游项目的关系
 
-- `src/pi/` 是 pi 上游 monorepo 的**完整功能代码**（12 个包 + 构建脚本 + 配置），整体搬迁后其内部相对路径（`../../scripts/*.mjs`、`tsconfig.base.json`）依然有效。
-- `src/ds-free-api/` 是 DeepSeek 反代服务的 Rust 参考实现；与本次融合相关的调用逻辑已移植到 `src/deepseek/*`，保留它仅作对照。
-- 两者都被 `tsconfig.json` 的 `exclude` 排除，**不参与本项目的编译**，因此不会拖慢或污染 `src/` 的构建。
+本项目把两个上游项目的能力**重新实现为 TypeScript**，仓库中不包含它们的源码副本：
 
-> ⚠️ **上游 pi 的完整构建在本机不可行**：其依赖链包含 `canvas`（需要 Visual Studio「使用 C++ 的桌面开发」工作负载，node-gyp 编译失败），并且本机的安全删除守卫会中断 npm 安装时的清理回滚。**可执行的是本项目 `src/`（融合 Agent）**；`src/pi` 作为源码与参考保留，具备 C++ 工具链的机器可自行 `npm run pi:install && npm run pi:build`。
->
-> 另：`src/pi/node_modules` 是一次**未完成安装的残留**（约 160MB，已被 `.gitignore` 忽略），可直接手动删除。
+- [pi](https://github.com/earendil-works/pi)（Pi Agent 终端版）：借鉴其 Agent 循环、工具抽象与系统提示词组织方式。
+  多供应商抽象与自研 TUI 未采用，改为内置单一供应商 + 自研行编辑器与底部状态栏。
+- [ds-free-api](https://github.com/NIyueeE/ds-free-api)（DeepSeek 网页版逆向 API，Rust）：
+  其 `ds_core` 的调用链（PoW 求解、SSE patch 状态机、原生 ChatML 提示词、伪造请求头）
+  已完整移植到 `src/deepseek/*`，本仓库不需要编译 Rust 二进制。
 
 ### 关键文件职责
 
@@ -317,11 +314,6 @@ npm run typecheck   # 仅类型检查
 npm run build       # tsc -> dist/
 npm start           # node dist/index.js
 npm run dev         # tsx 直接运行源码
-
-# 可选：构建上游 pi（需要 VS C++ 工具链，本机不可用）
-npm run pi:install  # 在 src/pi 安装上游依赖
-npm run pi:build    # 构建上游 pi CLI
-npm run pi:check    # 上游 lint + 类型检查
 ```
 
 `package.json` 的 `bin.pi-deepseek-web` 指向 `dist/index.js`，`npm link` 后可直接用 `pi-deepseek-web` 命令。
@@ -365,7 +357,7 @@ DeepSeek 编排 (src/deepseek/provider.ts)
 5. **账号风控**：DeepSeek 对网页端有 session 级限流，累计请求过多可能被临时禁言。**缓解**：默认 1200ms 间隔 + 流式请求失败指数退避重试；建议个人低频使用。
 6. **`exec` 工具可执行任意命令**：与所有编码 Agent 相同，仅在可信目录使用。
 7. **`Ctrl+S` 在极少数终端可能被当作流控（XOFF）**：readline 已处于 raw 模式，通常无影响；若失效请改用 `/search on|off`。
-8. **每轮请求新建会话**：与 `ds-free-api` 的无状态策略一致，代价是每轮多两次 HTTP 往返（建/删会话）。好处是上下文完全由 prompt 承载，无状态泄漏、无孤儿会话残留。
+8. **上下文由服务端保存**：`reuse` 模式下历史存在 DeepSeek 服务端。若你在网页端手动删除了该会话，本地的 `parentMessageId` 会失效 → 用 `/clear` 重新开始即可。
 9. **凭证文件存在 ≠ 已登录**：`auth/deepseek-web.json` 只是一个加密容器。若你手动放入了无效 token，程序会认为"已登录"但请求会返回 `40003`。现在 `/login` 会先校验再落盘，`/status` 也可随时做真实校验；聊天时若收到 `40003`，会自动清掉本地凭证并提示重新登录。
 10. **PoW 依赖 `expire_at` 字段**：服务端返回的是 snake_case（`expire_at` / `target_path`），
     必须在客户端映射为内部 camelCase，否则拼接出的 prefix 会变成 `salt_undefined_`，

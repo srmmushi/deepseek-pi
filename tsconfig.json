@@ -17,5 +17,5 @@
 		"types": ["node"]
 	},
 	"include": ["src/**/*.ts"],
-	"exclude": ["node_modules", "dist", "src/pi", "src/ds-free-api"]
+	"exclude": ["node_modules", "dist"]
 }
