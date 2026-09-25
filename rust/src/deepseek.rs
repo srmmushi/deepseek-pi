@@ -20,6 +20,7 @@ pub const ORIGIN: &str = "https://chat.deepseek.com";
 
 const EP_SESSION_CREATE: &str = "/chat_session/create";
 const EP_SESSION_DELETE: &str = "/chat_session/delete";
+const EP_SESSION_PAGE: &str = "/chat_session/fetch_page";
 const EP_POW_CHALLENGE: &str = "/chat/create_pow_challenge";
 const EP_COMPLETION: &str = "/chat/completion";
 const EP_STOP_STREAM: &str = "/chat/stop_stream";
@@ -513,6 +514,24 @@ impl DeepSeekClient {
                 code: -1,
                 message: "创建会话失败：缺少 chat_session.id".to_string(),
             })
+    }
+
+    /// 读取会话列表里某个会话的标题。
+    ///
+    /// 网页端在首轮结束后会自动给会话起名（「排查 Rust 生命周期报错」这种），
+    /// 比我们按提示词截断出来的好看。接口形状若变动，这里返回 None，
+    /// 调用方继续用本地标题，不影响任何功能。
+    pub fn session_title(&self, token: &str, session_id: &str) -> Option<String> {
+        let data = self
+            .post_json(EP_SESSION_PAGE, token, &json!({ "count": 50 }))
+            .ok()?;
+        data.get("chat_sessions")?
+            .as_array()?
+            .iter()
+            .find(|s| s.get("id").and_then(|v| v.as_str()) == Some(session_id))
+            .and_then(|s| s.get("title").and_then(|v| v.as_str()))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
     }
 
     /// 删除会话（失败静默）

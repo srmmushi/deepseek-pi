@@ -15,7 +15,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -188,8 +188,10 @@ impl Core {
     }
 
     fn status_text(&self) -> String {
+        // 最底下这一行同时承担「当前状态」和「两个开关的按键」：
+        // 不用记 Ctrl+T / Ctrl+S 是什么，看一眼最底下就行。
         format!(
-            "◆ {} · {} · {} {} · {} {} · {}",
+            "◆ {} · {} · Ctrl+T {} {} · Ctrl+S {} {} · {}",
             self.session_title,
             self.config.model,
             self.t("status.thinking"),
@@ -326,6 +328,20 @@ fn event_loop(
             do_login(core, app, &token);
         }
 
+        // Ctrl+T / Ctrl+S 的开关请求（界面层拿不到 core.config，只能这样回传）
+        if let Some(toggle) = app.take_toggle() {
+            match toggle {
+                ui::Toggle::Thinking => {
+                    core.config.thinking = !core.config.thinking;
+                    after_toggle(core, app, "toggle.thinking", core.config.thinking);
+                }
+                ui::Toggle::Search => {
+                    core.config.search = !core.config.search;
+                    after_toggle(core, app, "toggle.search", core.config.search);
+                }
+            }
+        }
+
         if let Some(input) = app.take_pending() {
             submit(core, app, input, &mut rx);
         }
@@ -348,6 +364,11 @@ fn event_loop(
         }
         match event::read()? {
             Event::Key(key) => {
+                // Windows 的控制台后端对一次按键会同时上报 Press 与 Release，
+                // 不过滤就会「敲一个字符出两个」。Linux/pty 只报 Press，此过滤无副作用。
+                if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                    continue;
+                }
                 let ctrl_c = key.modifiers.contains(KeyModifiers::CONTROL)
                     && matches!(key.code, KeyCode::Char('c'));
                 if ctrl_c && !app.has_selection() {
@@ -388,6 +409,17 @@ fn label_of(text: &str) -> String {
     }
 }
 
+/// 会话标题：把提示词压平成一行，最多留 28 字
+fn title_of(text: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let chars: Vec<char> = flat.chars().collect();
+    if chars.len() > 28 {
+        format!("{}…", chars[..28].iter().collect::<String>())
+    } else {
+        flat
+    }
+}
+
 fn start_turn(core: &mut Core, app: &mut App, input: String, rx: &mut Option<Receiver<UiEvent>>) {
     if core.token.is_none() {
         app.line_styled(format!("! {}", core.t("app.notLoggedIn")), ui::warn());
@@ -401,6 +433,15 @@ fn start_turn(core: &mut Core, app: &mut App, input: String, rx: &mut Option<Rec
         }
     };
     *core.aborted.lock().unwrap() = false;
+    // 首条提示词就是这次会话的标题：回车之后，右下角的「新会话」立刻换成它
+    {
+        let mut session = core.session.lock().unwrap();
+        if session.messages.is_empty() {
+            session.title = title_of(&input);
+        }
+    }
+    core.session_title = core.session.lock().unwrap().title.clone();
+    app.set_status(core.status_text());
     app.set_busy(true);
 
     let (tx, receiver): (Sender<UiEvent>, Receiver<UiEvent>) = mpsc::channel();

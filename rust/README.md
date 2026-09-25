@@ -75,6 +75,19 @@ token 取自 `chat.deepseek.com` 的 LocalStorage（key 是 `userToken`）。
 | `左键拖动` | 选择文本（反显） |
 | `左键单击块头` | 折叠 / 展开该块 |
 
+最底下那行常驻两个开关的按键和当前状态，不用记：
+
+```text
+◆ 排查 Rust 生命周期报错 · deepseek-chat · Ctrl+T 深度思考 开 · Ctrl+S 智能搜索 关 · zh
+```
+
+一轮结束后的页脚给出 token 用量与生成速率。速率只按**流式生成**那段算，
+工具执行的时间不计入（否则并行跑几个 exec 会把速率压得很难看）：
+
+```text
+· 715 tokens  ·  119.2 tok/s  ·  6.0s
+```
+
 ## 命令
 
 ```

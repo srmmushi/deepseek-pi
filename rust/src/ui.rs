@@ -21,6 +21,10 @@ const BANNER: [&str; 6] = [
     "╚═════╝ ╚══════╝ ╚═╝     ",
 ];
 
+/// banner 右侧说明文字的起始列（2 缩进 + 24 字形 + 2 间隔）。
+/// 让它贴着字形，而不是像表格一样甩到终端最右边。
+const BANNER_LABEL_COL: usize = 28;
+
 // 工具名各给一个颜色，扫一眼就知道模型在干什么
 fn tool_color(name: &str) -> Color {
     match name {
@@ -51,6 +55,14 @@ pub fn err() -> Style {
 
 pub fn warn() -> Style {
     Style::default().fg(Color::Yellow)
+}
+
+/// Ctrl+T / Ctrl+S 想切换的开关。
+/// `on_key` 里拿不到 core.config，所以只记一个请求，由主循环落地。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Toggle {
+    Thinking,
+    Search,
 }
 
 /// 扁排后的一屏行
@@ -107,6 +119,9 @@ pub struct App {
     login_mode: bool,
     login_input: Option<String>,
 
+    /// Ctrl+T / Ctrl+S 的切换请求，交给主循环去改 core.config
+    toggle_request: Option<Toggle>,
+
     anchors: Vec<(String, usize)>,
     selection: Option<(Pos, Pos)>,
     origin: Option<Pos>,
@@ -136,6 +151,7 @@ impl Default for App {
             last_thinking: String::new(),
             login_mode: false,
             login_input: None,
+            toggle_request: None,
             anchors: Vec::new(),
             selection: None,
             origin: None,
@@ -238,6 +254,10 @@ impl App {
             }
             UiEvent::ThinkEnd { text, ms } => {
                 self.think_since = None;
+                // 空思考（没开思考 / 模型没输出思考）只清状态，不留一行噪声
+                if text.trim().is_empty() {
+                    return;
+                }
                 let chars = text.chars().count();
                 let head = format!("▌ 思考 {} · {chars} 字 · Ctrl+O 展开", format_ms(ms));
                 let body = text
@@ -266,10 +286,14 @@ impl App {
                 let text = format!("└ {name}{}  {}", result.summary, format_ms(ms));
                 self.line_styled(text, if result.ok { Style::default().fg(Color::Gray) } else { err() });
             }
-            UiEvent::TurnDone { usage, ms } => {
+            UiEvent::TurnDone { usage, ms, gen_ms } => {
                 let mut bits = Vec::new();
                 if let Some(u) = usage {
                     bits.push(format!("{u} tokens"));
+                    // 速率只按「流式生成」那段算：把工具执行时间算进去会虚低得离谱
+                    if gen_ms > 0 {
+                        bits.push(format!("{:.1} tok/s", u as f64 * 1000.0 / gen_ms as f64));
+                    }
                 }
                 bits.push(format_ms(ms));
                 self.line("");
@@ -334,6 +358,11 @@ impl App {
         self.login_input.take()
     }
 
+    /// 取走 Ctrl+T / Ctrl+S 的切换请求
+    pub fn take_toggle(&mut self) -> Option<Toggle> {
+        self.toggle_request.take()
+    }
+
     /// 交给主循环写剪贴板（这里只负责把文本准备好）
     pub fn take_copied(&mut self) -> Option<String> {
         self.copied.take()
@@ -373,6 +402,9 @@ impl App {
             match key.code {
                 KeyCode::Char('c') => self.copy_or_clear_selection(),
                 KeyCode::Char('o') => self.toggle_last(),
+                // 只记请求，真正的开关在主循环里翻（见 Toggle）
+                KeyCode::Char('t') => self.toggle_request = Some(Toggle::Thinking),
+                KeyCode::Char('s') => self.toggle_request = Some(Toggle::Search),
                 KeyCode::Down => self.offset = 0,
                 KeyCode::Up => self.scroll(1 << 20),
                 _ => {}
@@ -675,7 +707,8 @@ impl App {
                 .iter()
                 .map(|s| s.content.chars().count())
                 .sum::<usize>();
-            let pad = width.saturating_sub(used + right.chars().count() + 2);
+            // 贴在字形右侧的固定列；窗口窄到塞不下时退化成 1 个空格
+            let pad = BANNER_LABEL_COL.min(width).saturating_sub(used).max(1);
             spans.push(Span::raw(" ".repeat(pad)));
             spans.push(Span::styled(right.clone(), *style));
         }

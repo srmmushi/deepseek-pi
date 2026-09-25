@@ -8,6 +8,7 @@
 //! 所以用一个 `Arc<Mutex<Assembled>>` 在两边共享。
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
@@ -40,8 +41,12 @@ pub enum UiEvent {
         ms: u128,
         parallel: bool,
     },
-    /// 一轮结束
-    TurnDone { usage: Option<u64>, ms: u128 },
+    /// 一轮结束。`gen_ms` 只统计流式生成耗时（不含工具执行），用于算 tok/s
+    TurnDone {
+        usage: Option<u64>,
+        ms: u128,
+        gen_ms: u128,
+    },
     /// 非致命提示
     Notice(String),
     /// 致命错误（已翻译成可读文案）
@@ -192,10 +197,8 @@ fn ensure_solver(runtime: &AgentRuntime, tx: &Sender<UiEvent>) -> bool {
     if guard.is_some() {
         return true;
     }
-    let _ = tx.send(UiEvent::Line(format!(
-        "下载 PoW WASM: {}",
-        runtime.config.wasm_url
-    )));
+    // 首次要下载并实例化官方 sha3 WASM，会停顿一两秒。
+    // 这里刻意不往输出区打字：那行提示会打断排版，而状态栏的计时已经能说明在忙。
     match load_pow_solver(
         &runtime.config.wasm_url,
         &runtime.config.user_agent,
@@ -241,6 +244,11 @@ pub fn run_turn(
     let turn_started = std::time::Instant::now();
     let mut total_usage: u64 = 0;
     let mut saw_usage = false;
+    // 累计的「纯生成」耗时，用于 token/s（工具执行的时间不算在内）
+    let mut gen_ms: u128 = 0;
+
+    // 本轮是不是这次会话的第一轮（决定要不要去网页端取会话名）
+    let first_turn = session.messages.is_empty();
 
     session
         .messages
@@ -262,6 +270,11 @@ pub fn run_turn(
         }
 
         let assembled = Arc::new(Mutex::new(Assembled::default()));
+        // 思考块必须先于正文上屏。正文是按行实时推给 UI 的，
+        // 若等整个流结束再发 ThinkEnd，思考块就会排到正文下面 —— 顺序就反了。
+        // 所以「正文一开始」就把思考收尾；sent 用于防止重复发送。
+        let think_sent = Arc::new(AtomicBool::new(false));
+        let stream_started = std::time::Instant::now();
         let stream_result = {
             let mut guard = runtime.solver.lock().unwrap();
             let Some(solver) = guard.as_mut() else {
@@ -270,6 +283,8 @@ pub fn run_turn(
             let tx_cb = tx.clone();
             let aborted = runtime.aborted.clone();
             let state = assembled.clone();
+            let sent_cb = think_sent.clone();
+            let mut think_started = std::time::Instant::now();
             let mut on_event = move |evt: StreamEvent| -> bool {
                 if *aborted.lock().unwrap() {
                     return false;
@@ -277,6 +292,8 @@ pub fn run_turn(
                 let mut acc = state.lock().unwrap();
                 match evt {
                     StreamEvent::ThinkStart => {
+                        think_started = std::time::Instant::now();
+                        sent_cb.store(false, Ordering::Relaxed);
                         let _ = tx_cb.send(UiEvent::ThinkStart);
                     }
                     StreamEvent::ThinkDelta(text) => {
@@ -286,7 +303,15 @@ pub fn run_turn(
                         drop(acc);
                         let _ = tx_cb.send(UiEvent::ThinkProgress { chars });
                     }
-                    StreamEvent::ContentStart => {}
+                    StreamEvent::ContentStart => {
+                        // 正文要开始了：先把思考块交出去，保证它排在正文上面
+                        if !sent_cb.swap(true, Ordering::Relaxed) {
+                            let text = std::mem::take(&mut acc.think);
+                            let ms = think_started.elapsed().as_millis();
+                            drop(acc);
+                            let _ = tx_cb.send(UiEvent::ThinkEnd { text, ms });
+                        }
+                    }
                     StreamEvent::ContentDelta(text) => {
                         acc.assistant.push_str(&text);
                         acc.pending.push_str(&text);
@@ -310,10 +335,22 @@ pub fn run_turn(
                         if usage.is_some() {
                             acc.usage = usage;
                         }
-                        if !acc.pending.is_empty() {
-                            let pending = std::mem::take(&mut acc.pending);
-                            drop(acc);
+                        let pending = std::mem::take(&mut acc.pending);
+                        // 只有思考、没有正文的回复（或始终没收到 ContentStart）也在这里收尾
+                        let closing = if sent_cb.swap(true, Ordering::Relaxed) {
+                            None
+                        } else {
+                            Some((
+                                std::mem::take(&mut acc.think),
+                                think_started.elapsed().as_millis(),
+                            ))
+                        };
+                        drop(acc);
+                        if !pending.is_empty() {
                             let _ = tx_cb.send(UiEvent::Line(pending));
+                        }
+                        if let Some((text, ms)) = closing {
+                            let _ = tx_cb.send(UiEvent::ThinkEnd { text, ms });
                         }
                     }
                 }
@@ -334,21 +371,25 @@ pub fn run_turn(
             )
         };
 
+        let stream_ms = stream_started.elapsed().as_millis();
+        gen_ms += stream_ms;
+
         let snapshot = {
             let acc = assembled.lock().unwrap();
-            (
-                acc.assistant.clone(),
-                acc.think.clone(),
-                acc.usage,
-            )
+            (acc.assistant.clone(), acc.usage)
         };
-        let (assistant_text, think_text, usage) = snapshot;
+        let (assistant_text, usage) = snapshot;
 
-        // 思考结束：把全文交给 UI（折叠为一行摘要，或展开回放）
-        if !think_text.is_empty() {
+        // 兜底：流式过程中途出错时既没走到 ContentStart 也没走到 Done，
+        // 思考态会一直挂在状态栏上，这里补一次收尾。
+        if !think_sent.swap(true, Ordering::Relaxed) {
+            let text = {
+                let mut acc = assembled.lock().unwrap();
+                std::mem::take(&mut acc.think)
+            };
             let _ = tx.send(UiEvent::ThinkEnd {
-                text: think_text,
-                ms: turn_started.elapsed().as_millis(),
+                text,
+                ms: stream_ms,
             });
         }
         if let Some(u) = usage {
@@ -442,9 +483,20 @@ pub fn run_turn(
         }
     }
 
+    // 首轮跑完，去网页端把自动起的会话名取回来（界面从共享的 Session 读，
+    // 所以这里直接写 session 即可）。取不到就保留按提示词截断的标题。
+    if first_turn && session.messages.len() >= 2 {
+        if let Some(sid) = session.handle.session_id.clone() {
+            if let Some(title) = runtime.client.session_title(&runtime.token, &sid) {
+                session.title = title;
+            }
+        }
+    }
+
     let _ = tx.send(UiEvent::TurnDone {
         usage: if saw_usage { Some(total_usage) } else { None },
         ms: turn_started.elapsed().as_millis(),
+        gen_ms,
     });
     let _ = tx.send(UiEvent::Finished);
 }
