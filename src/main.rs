@@ -206,6 +206,7 @@ fn grab(paths: &ConfigPaths) -> i32 {
 
     match found {
         Some((who, token)) => {
+            sysinfo::close_browser(&who);
             let ua = config::load_config(paths).user_agent;
             match auth::save_token_from_input(paths, &token, &ua) {
                 Ok(_) => {
@@ -916,8 +917,10 @@ fn open_login_page(core: &mut Core, app: &mut App, rx: &mut Option<Receiver<UiEv
 
     // 1) 浏览器里已经登录过：直接拿来用，页面都不用开。
     //    这里不额外打字，成功提示统一由 do_login 给。
-    if let Some((_who, token)) = browser::extract_user_token() {
+    if let Some((who, token)) = browser::extract_user_token() {
         do_login(core, app, &token);
+        // 凭证到手，浏览器不用留着了
+        sysinfo::close_browser(&who);
         return;
     }
 
@@ -954,7 +957,8 @@ fn open_login_page(core: &mut Core, app: &mut App, rx: &mut Option<Receiver<UiEv
         // 每 2 秒扫一次，最多等 5 分钟
         for _ in 0..150 {
             std::thread::sleep(Duration::from_secs(2));
-            if let Some((_who, token)) = browser::extract_user_token() {
+            if let Some((who, token)) = browser::extract_user_token() {
+                sysinfo::close_browser(&who);
                 let _ = tx.send(UiEvent::Token(token));
                 let _ = tx.send(UiEvent::Finished);
                 return;

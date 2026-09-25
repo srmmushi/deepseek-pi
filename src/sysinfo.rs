@@ -6,7 +6,7 @@
 //! 「Windows 宿主机里的浏览器」，两者差别很大（容器里往往根本没装），
 //! 所以列出来让用户选；其他系统直接自动识别即可。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::config::Lang;
@@ -257,6 +257,36 @@ pub fn open_url(browser: &Browser, url: &str, app_window: bool) -> std::io::Resu
         .stderr(Stdio::null())
         .spawn()
         .map(|_| ())
+}
+
+/// 关掉用完的浏览器。
+///
+/// WSL 下浏览器跑在 Windows 那边，借 interop 调 taskkill.exe；原生 Windows
+/// 用 taskkill；Linux / macOS 用 pkill 按进程名匹配。失败无所谓，不影响已拿到
+/// 的凭证。
+pub fn close_browser(browser: &str) {
+    let edge = browser.contains("Edge");
+    let (program, name) = if cfg!(target_os = "windows") {
+        ("taskkill", if edge { "msedge.exe" } else { "chrome.exe" })
+    } else if cfg!(target_os = "macos") {
+        ("pkill", if edge { "Microsoft Edge" } else { "Google Chrome" })
+    } else if Path::new("/mnt/c/Windows").is_dir() {
+        ("taskkill.exe", if edge { "msedge.exe" } else { "chrome.exe" })
+    } else {
+        ("pkill", if edge { "microsoft-edge" } else { "google-chrome" })
+    };
+
+    let mut command = Command::new(program);
+    if program.starts_with("taskkill") {
+        command.args(["/IM", name, "/F"]);
+    } else {
+        command.args(["-f", name]);
+    }
+    let _ = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 /// 一行描述（给 /info 与 /browser 用）

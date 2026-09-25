@@ -10,32 +10,12 @@ use std::ffi::OsStr;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-/// 浏览器：显示名 + Windows / Linux / macOS 三套 User Data 路径。Edge 优先。
-const BROWSERS: &[(&str, &str, &str, &str)] = &[
-    (
-        "Edge",
-        "Microsoft/Edge/User Data",
-        ".config/microsoft-edge",
-        "Library/Application Support/Microsoft Edge",
-    ),
-    (
-        "Chrome",
-        "Google/Chrome/User Data",
-        ".config/google-chrome",
-        "Library/Application Support/Google/Chrome",
-    ),
-    (
-        "Chromium",
-        "Chromium/User Data",
-        ".config/chromium",
-        "Library/Application Support/Chromium",
-    ),
-];
-
 const KEY: &[u8] = b"userToken";
 const ORIGIN: &[u8] = b"chat.deepseek.com";
 /// 单个文件最多读这么多
 const MAX_BYTES: u64 = 8 << 20;
+/// 遍历的最大层数
+const MAX_DEPTH: usize = 6;
 
 /// 一个候选目录的扫描结果
 pub struct Hit {
@@ -51,9 +31,9 @@ pub struct Hit {
 /// 扫遍所有候选目录
 pub fn scan() -> Vec<Hit> {
     let mut out = Vec::new();
-    for (name, dir) in leveldb_dirs() {
+    for (browser, dir) in leveldb_dirs() {
         let mut hit = Hit {
-            browser: name,
+            browser,
             dir: dir.clone(),
             key_hits: 0,
             origin: false,
@@ -82,47 +62,99 @@ pub fn extract_user_token() -> Option<(String, String)> {
         .find_map(|hit| hit.token.map(|token| (hit.browser, token)))
 }
 
-/// 所有可能的 `Local Storage/leveldb` 目录，按浏览器优先级排序
+/// 所有 `Local Storage/leveldb` 目录，Edge 优先。
+///
+/// 不拼路径：浏览器版本、安装位置、profile 名各不相同，拼出来十有八九对不上。
+/// 改成在几个根目录下有界遍历，找「父目录叫 Local Storage、自己叫 leveldb」的目录。
 fn leveldb_dirs() -> Vec<(String, PathBuf)> {
     let mut out = Vec::new();
-    for (name, win, linux, mac) in BROWSERS {
-        for root in user_data_roots(win, linux, mac) {
-            // 不写死 profile 名：枚举子目录，谁的 leveldb 在就算谁
-            let Ok(entries) = std::fs::read_dir(&root) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let dir = entry.path().join("Local Storage").join("leveldb");
-                if dir.is_dir() {
-                    out.push(((*name).to_string(), dir));
-                }
-            }
-        }
+    for root in search_roots() {
+        walk(&root, 0, &mut out);
     }
+    out.sort_by_key(|(name, _)| if name.as_str() == "Edge" { 0 } else { 1 });
     out
 }
 
-/// User Data 目录的候选位置。WSL 下浏览器在 Windows 那边，还要翻 /mnt/c/Users。
-fn user_data_roots(win: &str, linux: &str, mac: &str) -> Vec<PathBuf> {
+/// 遍历起点：本机用户目录，以及 WSL 下 Windows 那边的用户目录
+fn search_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        roots.push(PathBuf::from(local).join(win));
+        roots.push(PathBuf::from(local));
     }
     if let Some(home) = home() {
-        roots.push(home.join(linux));
-        roots.push(home.join(mac));
+        roots.push(home.join(".config"));
+        roots.push(home.join("Library").join("Application Support"));
     }
-    let users = Path::new("/mnt/c/Users");
-    if users.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(users) {
-            for entry in entries.flatten() {
-                if entry.path().is_dir() {
-                    roots.push(entry.path().join("AppData").join("Local").join(win));
-                }
+    if let Ok(entries) = std::fs::read_dir("/mnt/c/Users") {
+        for entry in entries.flatten() {
+            let local = entry.path().join("AppData").join("Local");
+            if local.is_dir() {
+                roots.push(local);
             }
         }
     }
     roots
+}
+
+/// 有界遍历。只往可能相关的目录里钻，不会把整个盘走一遍。
+fn walk(dir: &Path, depth: usize, out: &mut Vec<(String, PathBuf)>) {
+    if depth > MAX_DEPTH {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == "leveldb" {
+            if path
+                .parent()
+                .and_then(|p| p.file_name())
+                .is_some_and(|p| p == OsStr::new("Local Storage"))
+            {
+                out.push((browser_of(&path), path));
+            }
+            continue;
+        }
+        if is_relevant_dir(&name) {
+            walk(&path, depth + 1, out);
+        }
+    }
+}
+
+fn is_relevant_dir(name: &str) -> bool {
+    matches!(
+        name,
+        "User Data"
+            | "Local Storage"
+            | "Local"
+            | "AppData"
+            | "Application Support"
+            | ".config"
+            | "Microsoft"
+            | "Google"
+            | "Chromium"
+            | "Edge"
+            | "Chrome"
+            | "Default"
+    ) || name.starts_with("Profile")
+}
+
+fn browser_of(path: &Path) -> String {
+    let text = path.to_string_lossy().to_lowercase();
+    if text.contains("edge") {
+        "Edge".to_string()
+    } else if text.contains("chromium") {
+        "Chromium".to_string()
+    } else if text.contains("chrome") {
+        "Chrome".to_string()
+    } else {
+        "浏览器".to_string()
+    }
 }
 
 fn home() -> Option<PathBuf> {
@@ -173,19 +205,27 @@ fn token_in(bytes: &[u8]) -> Option<String> {
 
 /// 键名之后的字节里取 token
 fn token_after(rest: &[u8]) -> Option<String> {
-    // 值前面可能有一个编码标记字节（0 = UTF-16，1 = Latin-1）
-    let mut head = rest;
-    if matches!(head.first(), Some(0 | 1)) {
-        head = &head[1..];
+    let head = &rest[..rest.len().min(640)];
+    match head.first() {
+        // 0 = 值按 UTF-16LE 存（token 本身是 ASCII，但浏览器偶尔会这么存）
+        Some(0) => {
+            let units: Vec<u16> = head[1..]
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            pick(&String::from_utf16_lossy(&units))
+        }
+        // 1 = Latin-1
+        Some(1) => pick(std::str::from_utf8(&head[1..]).ok()?),
+        _ => pick(std::str::from_utf8(head).ok()?),
     }
-    let take = head.len().min(320);
-    let text = std::str::from_utf8(&head[..take]).ok()?;
+}
 
-    // 正常形态是 JSON：{"value":"<token>",...}
+/// 从一段文本里挑出 token：优先 JSON 的 value 字段，其次按裸 token 兜底
+fn pick(text: &str) -> Option<String> {
     if let Some(token) = json_value(text) {
         return Some(token);
     }
-    // 兼容没包 JSON 的形态：直接跟在后面的裸 token
     let bare: String = text.chars().take_while(|c| is_token_char(*c)).collect();
     (bare.len() >= 16).then_some(bare)
 }
