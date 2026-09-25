@@ -483,7 +483,9 @@ impl App {
     fn jump_to_row(&mut self, row: usize) {
         let total = self.rows.len();
         let height = self.view.1.max(1);
-        self.offset = total.saturating_sub(row).saturating_sub(height - 1);
+        // 目标行落在窗口第一行（上面留一行上下文），但不能超过滚动上限
+        let target = total.saturating_sub(row).saturating_sub(height - 1);
+        self.offset = target.min(total.saturating_sub(height));
     }
 
     pub fn on_mouse(&mut self, ev: MouseEvent) {
@@ -594,7 +596,12 @@ impl App {
     }
 
     pub fn scroll(&mut self, delta: isize) {
-        let max = self.rows.len().saturating_sub(1) as isize;
+        // 上限是「第一行刚好贴在窗口顶部」——再往上没有内容可看了。
+        // 旧版本这里用 rows.len() - 1，于是滚到顶之后 offset 还在涨，
+        // 而渲染时 end = total - offset 越算越小，视图被一节节缩没，
+        // 底部就露出空白行，看起来正是「空白把内容顶掉了」。
+        let height = self.view.1.max(1);
+        let max = self.rows.len().saturating_sub(height) as isize;
         self.offset = (self.offset as isize + delta).clamp(0, max) as usize;
     }
 
@@ -654,7 +661,9 @@ impl App {
         self.reflow(view.width as usize);
         let height = view.height as usize;
         let total = self.rows.len();
-        let end = total.saturating_sub(self.offset);
+        // 渲染前再兜一次底：保证 offset 不会让窗口变窄（不变式：start + height == end）
+        self.offset = self.offset.min(total.saturating_sub(height));
+        let end = total - self.offset;
         let start = end.saturating_sub(height);
         self.view = (start, height);
 
