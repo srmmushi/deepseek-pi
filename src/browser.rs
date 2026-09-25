@@ -237,8 +237,6 @@ fn find_token(bytes: &[u8]) -> Option<String> {
     // 匹配不到：Chrome/Edge 在 origin 与键名之间插的标记字节各家版本并不一致
     // （有的带 \x01、有的不带）。改成「键名前 48 字节内出现域名」既容错，
     // 又不会把别处出现的同名字符串误当成 localStorage 记录。
-    const KEY: &[u8] = b"userToken";
-    const ORIGIN: &[u8] = b"chat.deepseek.com";
     let mut from = 0;
     while let Some(at) = find(&bytes[from..], TOKEN_KEY) {
         let start = from + at;
