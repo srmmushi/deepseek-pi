@@ -61,8 +61,22 @@ cargo build --release            # 产物：target/release/dsp
 /login wechatqr   微信扫码：二维码画在终端里，过期自动换一张，确认后自动写入凭证
 ```
 
-`/login browser` 用自动识别出的浏览器打开 `chat.deepseek.com/sign_in`：
-登录后在该页按 F12，控制台执行 `localStorage.getItem('userToken')`，再用 `/login token` 粘回来。
+### `/login` 会自动去浏览器里取凭证
+
+浏览器（默认 **Edge**，其次 Chrome/Chromium）把 userToken 存在 localStorage 里，
+而 localStorage 落在 `Local Storage/leveldb/` 的 LevelDB 文件里。所以 `/login` 分两步：
+
+1. **先直接扫一遍浏览器存储** —— 如果浏览器里已经登录过，连页面都不用开，凭证直接到手
+2. 没扫到 → 用 Edge 打开 `chat.deepseek.com/sign_in`，然后在后台**每 2 秒扫一次**，
+   你扫码/输密码登录成功的那一刻，凭证自动被读回来（最多等 5 分钟）
+
+于是整个流程不需要手动复制粘贴，也不用按 F12 翻控制台。
+
+实现上没有去完整解析 LevelDB（那要几百行还得解 snappy），而是直接在原始字节里
+找 `userToken` 这个键、把后面的值取出来 —— Chrome/Edge 的写入日志（`.log`）不压缩，
+刚登录的记录一定在里面。已经落盘进 `.ldb` 且被 snappy 压过的旧记录可能扫不到，
+那时退回 `/login token` 手动粘贴。
+
 `DSP_TOKEN=<token> dsp` 依然可用，`/login` 时会优先采用。
 
 加密格式固定不变，所以磁盘上已有的凭证可以直接复用 —— `--selftest` 就是确认这件事的。

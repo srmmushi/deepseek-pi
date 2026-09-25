@@ -1,5 +1,6 @@
 mod agent;
 mod auth;
+mod browser;
 mod clipboard;
 mod config;
 mod deepseek;
@@ -62,13 +63,14 @@ DSP (deepseek-pi) —— 终端编程助手，仅使用 DeepSeek 网页版
   Ctrl+T / Ctrl+S    切换深度思考 / 智能搜索（状态栏显示当前值，不打断输出）
 
 登录
-  /login                打开登录页（等同 /login browser）
+  /login                先自动读浏览器里已登录的凭证（Edge 优先）；
+                        没有就用 Edge 打开登录页，登录成功后自动读回凭证
   /login token          手动粘贴 userToken
   /login passwd         手机号 / 邮箱 + 密码
   /login wechatqr       微信扫码，二维码直接画在终端里
   DSP_TOKEN=<token> dsp 环境变量，/login 时优先采用
-  userToken 取法：登录 chat.deepseek.com 后按 F12，
-  控制台执行 localStorage.getItem('userToken')。
+  userToken 存在浏览器 localStorage 里（key 为 userToken），
+  上面第一条会自动去 Edge/Chrome 的 LevelDB 里把它抠出来。
   加密格式未变，磁盘上已有的凭证可以直接复用。";
 
 /// 登录页地址（DeepSeek 网页端登录页）
@@ -759,7 +761,7 @@ fn command(
         "/login" => {
             let what = if arg.is_empty() { "browser" } else { arg.as_str() };
             match what {
-                "browser" | "web" => open_login_page(core, app),
+                "browser" | "web" => open_login_page(core, app, rx),
                 "token" | "paste" => {
                     core.login_stage = STAGE_TOKEN;
                     app.start_login(true);
@@ -793,9 +795,9 @@ fn command(
     }
 }
 
-/// /login browser：打开 DeepSeek 登录页，登录后把 userToken 取回来。
-/// 环境里已经给了 DSP_TOKEN 就直接用，不折腾浏览器。
-fn open_login_page(core: &mut Core, app: &mut App) {
+/// /login browser：先把浏览器里已有的登录态读出来，没有就打开登录页等着，
+/// 登录成功后再自动把 userToken 读回来 —— 全程不用手动复制粘贴。
+fn open_login_page(core: &mut Core, app: &mut App, rx: &mut Option<Receiver<UiEvent>>) {
     if let Ok(token) = std::env::var("DSP_TOKEN") {
         if !token.trim().is_empty() {
             let token = token.trim().to_string();
@@ -803,6 +805,15 @@ fn open_login_page(core: &mut Core, app: &mut App) {
             return;
         }
     }
+
+    // 1) 浏览器里已经登录过：直接拿来用，页面都不用开
+    if let Some((who, token)) = browser::extract_user_token() {
+        app.line_styled(format!("从 {who} 的存储里读到了已登录的 userToken"), ui::dim());
+        do_login(core, app, &token);
+        return;
+    }
+
+    // 2) 没有就打开登录页（默认 Edge）
     let list = sysinfo::detect_browsers();
     let in_wsl = sysinfo::wsl_version().is_some();
     match sysinfo::resolve(&list, &core.config.browser) {
@@ -811,20 +822,42 @@ fn open_login_page(core: &mut Core, app: &mut App) {
             match sysinfo::open_url(&list[i], SIGN_IN_URL) {
                 Ok(()) => {
                     app.line_styled(format!("已用 {shown} 打开 {SIGN_IN_URL}"), ui::ok());
-                    app.line_styled(
-                        "登录后在该页按 F12，控制台执行 localStorage.getItem('userToken')，\
-                         再用 /login token 把结果粘进来。",
-                        ui::dim(),
-                    );
+                    app.line_styled("扫码或账密登录，成功后凭证会自动读回来。", ui::dim());
                 }
-                Err(e) => app.line_styled(format!("打开浏览器失败：{e}"), ui::err()),
+                Err(e) => {
+                    app.line_styled(format!("打开浏览器失败：{e}"), ui::err());
+                    return;
+                }
             }
         }
-        None => app.line_styled(
-            format!("没检测到浏览器，手动打开 {SIGN_IN_URL} 吧。"),
-            ui::warn(),
-        ),
+        None => {
+            app.line_styled(
+                format!("没检测到浏览器，手动打开 {SIGN_IN_URL} 登录。"),
+                ui::warn(),
+            );
+            app.line_styled("登录完成后仍会自动读取凭证。", ui::dim());
+        }
     }
+
+    // 3) 后台盯着浏览器存储，登录一完成就把 token 读回来
+    let (tx, receiver): (Sender<UiEvent>, Receiver<UiEvent>) = mpsc::channel();
+    *rx = Some(receiver);
+    std::thread::spawn(move || {
+        // 每 2 秒扫一次，最多等 5 分钟
+        for _ in 0..150 {
+            std::thread::sleep(Duration::from_secs(2));
+            if let Some((who, token)) = browser::extract_user_token() {
+                let _ = tx.send(UiEvent::Line(format!("已从 {who} 读取到 userToken")));
+                let _ = tx.send(UiEvent::Token(token));
+                let _ = tx.send(UiEvent::Finished);
+                return;
+            }
+        }
+        let _ = tx.send(UiEvent::Notice(
+            "等了 5 分钟还没读到 userToken，可以用 /login token 手动粘贴。".to_string(),
+        ));
+        let _ = tx.send(UiEvent::Finished);
+    });
 }
 
 /// 密码登录第二步：拿账号 + 密码去换 token

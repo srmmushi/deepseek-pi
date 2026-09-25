@@ -231,10 +231,12 @@ pub fn resolve(list: &[Browser], choice: &str) -> Option<usize> {
     list.iter().position(|b| b.id == choice)
 }
 
-/// 自动选择：WSL 下容器里往往没装浏览器，所以优先宿主机；否则取第一个
+/// 自动选择。默认 **Edge**：Windows/WSL 下几乎必然装得有，
+/// 而且和浏览器里已有的 DeepSeek 登录态是同一套；其次才是宿主机浏览器。
 fn prefer_auto(list: &[Browser]) -> Option<usize> {
     list.iter()
-        .position(|b| b.host)
+        .rposition(|b| b.label.contains("Edge"))
+        .or_else(|| list.iter().position(|b| b.host))
         .or(if list.is_empty() { None } else { Some(0) })
 }
 
