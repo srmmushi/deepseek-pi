@@ -268,9 +268,11 @@ export async function startRepl(app: App): Promise<void> {
 	if (!bar.enabled) info(statusLine(app));
 
 	// ── 尺寸变化 ──────────────────────────────────────────
+	// 顺序很重要：handleResize 会重建滚动区域并把光标重新锚定到底部，
+	// 之后才能安全地重算提示行与重绘输入行（否则输入行会漂到旧位置）。
 	process.stdout.on("resize", () => {
 		bar.handleResize();
-		bar.set(defaultHint, barStatus());
+		updateHint();
 		editor.redraw();
 	});
 
