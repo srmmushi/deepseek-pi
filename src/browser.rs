@@ -319,13 +319,16 @@ fn token_after(rest: &[u8]) -> Option<String> {
     None
 }
 
-/// 同一段字节按可能的编码各解一次
+/// 同一段字节按可能的编码各解一次。
+///
+/// 必须用 from_utf8_lossy：LevelDB 块里混着变长整数、CRC 这些二进制字节，
+/// 要求整段都是合法 UTF-8 就永远解不出来，而 token 本身是纯 ASCII，
+/// 旁边有无非法字节并不影响它。
 fn decode(bytes: &[u8]) -> Vec<String> {
-    let head = &bytes[..bytes.len().min(1024)];
-    let mut out = Vec::new();
-    if let Ok(text) = std::str::from_utf8(head) {
-        out.push(text.to_string());
-    }
+    // 窗口只取 256 字节：一条 localStorage 记录不到 100 字节，
+    // 窗口开太大反而容易在别的记录里撞上同名字段
+    let head = &bytes[..bytes.len().min(256)];
+    let mut out = vec![String::from_utf8_lossy(head).to_string()];
     // 首位是 0 说明按 UTF-16LE 存
     if head.first() == Some(&0) && head.len() > 8 {
         let units: Vec<u16> = head[1..]
