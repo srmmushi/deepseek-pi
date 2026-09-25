@@ -50,8 +50,6 @@ const COMMANDS: &[(&str, &str, &str)] = &[
 
 /// 命令列表最多占几行，免得把输出区挤没
 const MAX_HINT_LINES: usize = 10;
-/// 命令名对齐到第几列
-const HINT_NAME_COL: usize = 18;
 
 // 工具名各给一个颜色，扫一眼就知道模型在干什么
 fn tool_color(name: &str) -> Color {
@@ -768,17 +766,16 @@ impl App {
         } else {
             ("❯ ", Style::default().fg(Color::Cyan))
         };
-        // 匹配到的命令逐行列在输入行上方：命令名青色，描述暗色
+        // 逐行列出匹配到的命令，就排在输入行上方：
+        //   /session 列出历史会话；带编号进入并载入上下文
+        // 一行一个命令、一行一条描述，不缩进也不做列对齐。
         if let Some(area) = hint_area {
             let lines: Vec<Line> = hints
                 .iter()
                 .map(|(name, desc)| {
-                    let pad = HINT_NAME_COL.saturating_sub(name.chars().count());
                     Line::from(vec![
-                        Span::styled(
-                            format!("  {name}{}", " ".repeat(pad)),
-                            Style::default().fg(Color::Cyan),
-                        ),
+                        Span::styled((*name).to_string(), Style::default().fg(Color::Cyan)),
+                        Span::raw(" "),
                         Span::styled((*desc).to_string(), dim()),
                     ])
                 })
