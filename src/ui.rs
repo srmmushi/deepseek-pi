@@ -25,27 +25,33 @@ const BANNER: [&str; 6] = [
 /// 让它贴着字形，而不是像表格一样甩到终端最右边。
 const BANNER_LABEL_COL: usize = 28;
 
-/// 斜杠命令清单，只用于「输入 / 时的实时提示」。
+/// 斜杠命令清单：命令 + 一行描述（中/英）。
+/// 输入以 `/` 开头时，匹配到的会逐行列在输入行上方。
 /// 真正的分发在 main.rs 的 command()，这里只负责让人看见有哪些。
-const COMMANDS: &[&str] = &[
-    "/help",
-    "/login",
-    "/logout",
-    "/new",
-    "/session",
-    "/clear",
-    "/goto",
-    "/thinking",
-    "/search",
-    "/thinking-view",
-    "/model",
-    "/lang",
-    "/status",
-    "/info",
-    "/open",
-    "/system-prompt",
-    "/quit",
+const COMMANDS: &[(&str, &str, &str)] = &[
+    ("/help", "查看命令列表", "list commands"),
+    ("/login", "登录（浏览器 / token / 账密 / 微信扫码）", "sign in"),
+    ("/logout", "清除本地凭证", "clear credentials"),
+    ("/new", "新建会话（清屏并清空上下文）", "new session"),
+    ("/session", "列出历史会话；带编号进入并载入上下文", "list or enter a session"),
+    ("/clear", "清空当前会话的上下文", "clear context"),
+    ("/goto", "跳转到某条提示词", "jump to a prompt"),
+    ("/thinking", "开关深度思考", "toggle thinking"),
+    ("/search", "开关智能搜索", "toggle search"),
+    ("/thinking-view", "展开或折叠思考正文", "expand thinking"),
+    ("/model", "查看或切换模型", "show or switch model"),
+    ("/lang", "切换中英文", "switch language"),
+    ("/status", "查看当前状态与各项路径", "show status"),
+    ("/info", "查看系统、架构、构建号", "show environment"),
+    ("/open", "用浏览器打开网页", "open a URL"),
+    ("/system-prompt", "查看、编辑或重置系统提示词", "edit system prompt"),
+    ("/quit", "退出", "quit"),
 ];
+
+/// 命令列表最多占几行，免得把输出区挤没
+const MAX_HINT_LINES: usize = 10;
+/// 命令名对齐到第几列
+const HINT_NAME_COL: usize = 18;
 
 // 工具名各给一个颜色，扫一眼就知道模型在干什么
 fn tool_color(name: &str) -> Color {
@@ -341,6 +347,22 @@ impl App {
                 self.think_since = None;
             }
         }
+    }
+
+    /// 输入以 `/` 开头时，要列在输入行上方的 (命令, 描述) 列表。
+    /// 敲 `/` 给全部，敲 `/s` 只剩 `/s` 开头的。
+    fn command_hints(&self, lang: Lang) -> Vec<(&'static str, &'static str)> {
+        if self.login_mode || !self.input.starts_with('/') {
+            return Vec::new();
+        }
+        let want = self.input.to_ascii_lowercase();
+        let zh = lang == Lang::Zh;
+        COMMANDS
+            .iter()
+            .filter(|(name, _, _)| name.starts_with(&want))
+            .take(MAX_HINT_LINES)
+            .map(|(name, cn, en)| (*name, if zh { *cn } else { *en }))
+            .collect()
     }
 
     /// 清空输出区（/new 用）。保留状态栏与输入行。
@@ -697,10 +719,29 @@ impl App {
 
     pub fn draw(&mut self, frame: &mut Frame, lang: Lang) {
         let area = frame.area();
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(3), Constraint::Length(1), Constraint::Length(1)])
-            .split(area);
+        // 命令提示是动态高度：输入以 / 开头时它才出现，
+        // 逐行列出匹配到的命令，正好排在输入行上方。
+        let hints = self.command_hints(lang);
+        let chunks = if hints.is_empty() {
+            Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(3), Constraint::Length(1), Constraint::Length(1)])
+                .split(area)
+        } else {
+            Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Min(3),
+                    Constraint::Length(hints.len() as u16),
+                    Constraint::Length(1),
+                    Constraint::Length(1),
+                ])
+                .split(area)
+        };
+        let shifted = if hints.is_empty() { 0 } else { 1 };
+        let hint_area = if shifted == 1 { Some(chunks[1]) } else { None };
+        let input_area = chunks[1 + shifted];
+        let status_area = chunks[2 + shifted];
 
         let view = chunks[0];
         self.reflow(view.width as usize);
@@ -720,7 +761,6 @@ impl App {
             .collect();
         frame.render_widget(Paragraph::new(lines), view);
 
-        let input_area = chunks[1];
         let (prompt, prompt_style) = if self.login_mode {
             ("token › ", Style::default().fg(Color::Yellow))
         } else if self.input.starts_with('!') {
@@ -728,29 +768,22 @@ impl App {
         } else {
             ("❯ ", Style::default().fg(Color::Cyan))
         };
-        // 输入以 / 开头时，在输入行右侧实时列出匹配的命令：
-        // 敲 / 看全部，敲 /s 只剩 /s 开头的。
-        if self.input.starts_with('/') && !self.login_mode {
-            let want = self.input.to_ascii_lowercase();
-            let matched: Vec<&str> = COMMANDS
+        // 匹配到的命令逐行列在输入行上方：命令名青色，描述暗色
+        if let Some(area) = hint_area {
+            let lines: Vec<Line> = hints
                 .iter()
-                .filter(|c| c.starts_with(&want))
-                .copied()
+                .map(|(name, desc)| {
+                    let pad = HINT_NAME_COL.saturating_sub(name.chars().count());
+                    Line::from(vec![
+                        Span::styled(
+                            format!("  {name}{}", " ".repeat(pad)),
+                            Style::default().fg(Color::Cyan),
+                        ),
+                        Span::styled((*desc).to_string(), dim()),
+                    ])
+                })
                 .collect();
-            let used = prompt.chars().count() + self.input.chars().count();
-            let avail = (input_area.width as usize).saturating_sub(used + 2);
-            if !matched.is_empty() && avail > 6 {
-                let shown: String = matched.join(" ").chars().take(avail).collect();
-                let pad = (input_area.width as usize)
-                    .saturating_sub(used + shown.chars().count() + 1);
-                frame.render_widget(
-                    Paragraph::new(Line::from(Span::styled(
-                        format!("{}{}", " ".repeat(pad), shown),
-                        dim(),
-                    ))),
-                    input_area,
-                );
-            }
+            frame.render_widget(Paragraph::new(lines), area);
         }
 
         // token / 密码掩码显示，屏幕上看不到原文
@@ -777,7 +810,7 @@ impl App {
                 self.status_text(lang),
                 if self.busy { Style::default().fg(Color::Yellow) } else { dim() },
             ))),
-            chunks[2],
+            status_area,
         );
 
         if let Some(goto) = &self.goto {
