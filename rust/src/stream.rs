@@ -1,6 +1,6 @@
 //! SSE 流解析：把 DeepSeek 的 p/o/v patch 协议转换为结构化事件
 //!
-//! 与 TS 版逐条对齐：p / o 跨事件持久化、o 默认 SET、BATCH 递归分解（子路径前置父路径）、
+//! 协议要点：p / o 跨事件持久化、o 默认 SET、BATCH 递归分解（子路径前置父路径）、
 //! 用 fragments 的 type 区分 THINK / RESPONSE、status=FINISHED/INCOMPLETE 视为终止。
 
 use serde_json::Value;

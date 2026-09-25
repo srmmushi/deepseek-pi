@@ -24,7 +24,7 @@ reqwest = { version = "0.12", default-features = false, features = [
 # 序列化
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# 加密（与 TS 版逐字节一致，才能复用已有凭证）
+# 加密（与历史 TypeScript 实现逐字节一致，才能复用已有凭证）
 aes-gcm = "0.10"
 scrypt = { version = "0.11", default-features = false }
 rand = "0.8"

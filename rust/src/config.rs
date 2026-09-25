@@ -1,7 +1,7 @@
 //! 配置目录解析与运行时配置读写
 //!
 //! 目录优先级（从高到低）：`--config-dir` > 环境变量 `PI_CONFIG_DIR` > `~/.pi/agent`。
-//! 路径与文件格式刻意与 TS 版保持一致，这样可以直接复用已有的登录凭证与会话。
+//! 路径与文件格式刻意与历史实现保持一致，这样可以直接复用已有的登录凭证与会话。
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -210,7 +210,7 @@ fn ensure_parent(file: &Path) -> Result<()> {
     Ok(())
 }
 
-/// 写入 JSON（缩进用 Tab，与 TS 版一致）
+/// 写入 JSON（缩进用 Tab，与历史实现一致）
 pub fn write_json<T: Serialize>(file: &Path, value: &T) -> Result<()> {
     ensure_parent(file)?;
     let text = serde_json::to_string_pretty(value)?;

@@ -1,6 +1,6 @@
 //! 登录凭证：加密存储 + 载入
 //!
-//! 加密方案与 TS 版**逐字节一致**：
+//! 加密方案**逐字节固定**（由历史 TypeScript 实现确定，改了已有凭证就解不开）：
 //!   key   = scrypt(机器指纹, "pi-deepseek-web/v1", 32)   （Node scrypt 默认参数 N=16384,r=8,p=1）
 //!   指纹  = hostname | username | platform | arch      （platform/arch 用 Node 的取值）
 //!   密文  = base64(iv[12]) + base64(tag[16]) + base64(ciphertext)，AES-256-GCM

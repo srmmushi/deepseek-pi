@@ -1,440 +1,122 @@
 # DSP (deepseek-pi)
 
-**DSP** —— 融合 [pi](https://github.com/earendil-works/pi)（Pi Agent 终端版）与 [deepseek-reverse-api](https://github.com/Wu-jiyan/deepseek-reverse-api)（DeepSeek 网页端逆向 API）的能力、重写而成的**终端编程助手**：
+终端编程助手。只通过 **DeepSeek 网页版**（`chat.deepseek.com`）推理，不依赖官方 API Key ——
+复刻网页端的鉴权与 PoW 流程，拿网页会话的 `userToken` 直接用。
 
-- **只有一个供应商**：DeepSeek 网页版（`chat.deepseek.com`），启动即用，无需选择。
-- **`/login` 自动抓 token**：拉起可见浏览器 → 用户正常登录 → 自动从 LocalStorage 读取凭证 → 加密落盘，**全程不需要打开 DevTools 复制任何东西**。
-- **不再单独起后端服务**：DeepSeek 的调用逻辑（伪造 UA、PoW、SSE 解析）已内嵌为 TypeScript 模块。
-- **工具并行执行**：模型可在一轮里同时发出多个工具调用（并行读多个文件、一边读文件一边跑命令），**互不依赖的调用同时执行**，界面用 `· N 个工具并行 · 498ms` 汇总行展示批次总耗时。
-- **零重型依赖**：运行时只依赖 `playwright`（登录）与 `undici`（可选代理）。
-
-> ⚠️ 本项目为学习 / 自用性质的逆向实现。请勿商用，避免给 DeepSeek 官方服务器造成压力。
-
----
-
-## 1. 目录结构
+纯 Rust + Ratatui，约 4300 行，代码在 [`rust/`](rust)。
 
 ```text
-Pi-DeepSeek-Web/
-├── package.json                 # 依赖与构建脚本（name: deepseek-pi，bin: dsp）
-├── tsconfig.json                # ESM + NodeNext + 严格模式
-├── README.md
-├── src/
-│   ├── index.ts                 # CLI 入口（--help / --config-dir / 单命令模式）
-│   ├── app.ts                   # 应用状态中枢（配置 + 凭证 + 客户端 + 求解器 + 历史）
-│   │
-│   ├── cli/
-│   │   └── args.ts              # 命令行参数解析与帮助文本
-│   │
-│   ├── config/
-│   │   ├── dirs.ts              # 配置目录解析（--config-dir > PI_CONFIG_DIR > ~/.pi/agent）
-│   │   └── store.ts             # config.json / models.json 读写与默认值
-│   │
-│   ├── i18n/
-│   │   └── index.ts             # 中英双语文案 + 系统语言探测
-│   │
-│   ├── auth/
-│   │   ├── crypto.ts            # 基于机器标识派生密钥的 AES-256-GCM
-│   │   ├── store.ts             # auth/deepseek-web.json 读写
-│   │   └── login.ts             # Playwright 登录，轮询 LocalStorage 抓 userToken
-│   │
-│   ├── deepseek/
-│   │   ├── client.ts            # REST 客户端（伪造 UA / Origin / Referer + 限速 + 代理）
-│   │   ├── pow.ts               # WASM PoW（DeepSeekHashV1）求解与缓存
-│   │   ├── stream.ts            # SSE p/o/v patch 状态机 → 结构化事件
-│   │   ├── prompt.ts            # DeepSeek 原生 ChatML 标签提示词构建
-│   │   └── provider.ts          # 单次 completion 编排（建会话→PoW→流式→清理）
-│   │
-│   ├── tools/
-│   │   ├── types.ts             # ToolCall / ToolContext / ToolResult
-│   │   ├── parser.ts            # 文本工具调用解析器（write/read/list/exec/search）
-│   │   ├── fs-tools.ts          # write / read / list / search
-│   │   ├── exec.ts              # exec（shell 命令）
-│   │   └── index.ts             # 工具分发 + 提示词中的工具说明（双语）
-│   │
-│   ├── prompt/
-│   │   └── system-prompt.ts     # system-prompt.md 加载 / 编辑 / 重置
-│   │
-│   ├── agent/
-│   │   ├── loop.ts              # Agent 主循环（流式 → 解析工具 → 执行 → 回灌）
-│   │   ├── commands.ts          # 斜杠命令实现
-│   │   └── repl.ts              # 交互式 REPL（流式渲染 / 状态栏 / 快捷键）
-│   │
-│   ├── ui/
-│   │   ├── banner.ts            # ASCII 字形
-│   │   ├── line-editor.ts       # 自研单行编辑器（替代 node:readline）
-│   │   ├── output.ts            # ANSI 配色与输出原语
-│   │   ├── palette.ts           # 命令面板 / 补全提示
-│   │   ├── statusbar.ts         # 固定底部状态栏（滚动区域）
-│   │   └── text.ts              # 显示宽度对齐（CJK / ANSI 感知）
-│   │
-└── （构建输出）
-    └── dist/                    # npm run build 产物
-```
-
-### 与上游项目的关系
-
-本项目把两个上游项目的能力**重新实现为 TypeScript**，仓库中不包含它们的源码副本：
-
-- [pi](https://github.com/earendil-works/pi)（Pi Agent 终端版）：借鉴其 Agent 循环、工具抽象与系统提示词组织方式。
-  多供应商抽象与自研 TUI 未采用，改为内置单一供应商 + 自研行编辑器与底部状态栏。
-- [deepseek-reverse-api](https://github.com/Wu-jiyan/deepseek-reverse-api)（DeepSeek 网页端逆向 API，Python，OpenAI 兼容）：
-  其调用链 —— PoW 挑战求解、SSE 增量（patch）解析、原生 ChatML 提示词组织、浏览器请求头伪造 ——
-  已用 TypeScript 重新实现于 `src/deepseek/*`，因此本仓库**不需要再单独部署 Python 服务**。
-
-### 关键文件职责
-
-| 文件 | 对应上游能力 | 职责 |
-|------|-------------|------|
-| `src/auth/login.ts` | 新增（替代账号密码登录） | 可见浏览器登录 + LocalStorage 抓 `userToken` |
-| `src/auth/crypto.ts` | 新增 | 机器标识派生密钥的 AES-256-GCM 加密 |
-| `src/deepseek/client.ts` | 账户 / HTTP 客户端层 | REST 端点 + 伪造浏览器头 |
-| `src/deepseek/pow.ts` | PoW 求解器 | WASM PoW（`DeepSeekHashV1`） |
-| `src/deepseek/stream.ts` | 流式响应解析 | SSE patch 状态机 |
-| `src/deepseek/prompt.ts` | 请求提示词构建 | DeepSeek 原生标签提示词 |
-| `src/deepseek/provider.ts` | 对话编排 | 一次 completion 的完整生命周期 |
-| `src/agent/loop.ts` | `packages/agent/src/agent-loop.ts`（精简） | Agent 主循环 |
-| `src/agent/repl.ts` | `packages/coding-agent/src/modes/interactive`（精简） | 交互式界面 |
-| `src/agent/session-store.ts` | `packages/coding-agent/src/core/agent-session.ts`（精简） | 会话持久化 + 与网页会话 1:1 绑定 |
-| `src/prompt/system-prompt.ts` | `packages/coding-agent/src/core/system-prompt.ts`（精简） | 系统提示词 |
-
----
-
-## 2. 快速开始
-
-```bash
-# 1) 安装依赖（跳过 Playwright 浏览器下载，默认复用本机 Chrome/Edge）
-PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm install
-# Windows PowerShell:
-#   $env:PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1; npm install
-
-# 2) 首次登录：重新构建后进入交互模式，然后直接输入 login
-npm run build
-npm start
-#   进入后输入：  login        （也支持 /login；默认用 Edge 打开）
-
-# 3) 登录后可校验凭证是否真的有效
-#   输入：        /status
-```
-
-**登录行为说明**
-
-- 默认使用 **Edge** 打开登录页；可通过环境变量覆盖：
-  ```powershell
-  $env:PI_LOGIN_BROWSER = "chrome"    # msedge（默认）| chrome | chromium
-  ```
-- 只认 LocalStorage 中**精确键名** `userToken` / `user_token`，不会再误抓其它带 token 的键。
-- 抓到后会**先用一次真实鉴权请求校验**（创建会话→删除会话），
-  **校验通过才算登录成功**；校验失败会继续等待你完成登录，并打印失败原因。
-- 界面顶部会显示项目 ASCII banner，以及凭证状态（token 长度）。
-
-> 若本机没有 Chrome / Edge，请安装 Chromium：`npx playwright install chromium`。
-
-### 常用命令
-
-```bash
-dsp                          # 交互模式
-dsp /login                   # 单命令模式：登录后退出
-dsp --config-dir ./my-conf   # 自定义配置目录
-PI_CONFIG_DIR=./my-conf dsp  # 用环境变量指定配置目录
-dsp --help
-```
-
----
-
-## 3. 配置目录
-
-优先级：`--config-dir` > 环境变量 `PI_CONFIG_DIR` > 默认 `~/.pi/agent`。
-
-```text
-~/.pi/agent/
-├── auth/
-│   └── deepseek-web.json     # 加密后的 token + UA（明文仅 UA 与时间戳）
-├── sessions/
-│   └── <uuid>.json           # 每个会话：标题 / 工作目录 / 网页会话 id / parentMessageId / 消息历史
-├── config.json               # 语言 / 开关 / 模型 / UA / wasmUrl / proxy / contextMode 等
-├── models.json               # 只有一个 provider：deepseek-web
-└── system-prompt.md          # 可编辑的系统提示词
-```
-
-### `config.json` 字段
-
-| 字段 | 说明 |
-|------|------|
-| `language` | `zh` / `en`，默认跟随系统 |
-| `thinking` | 深度思考开关（对应 `thinking_enabled`） |
-| `search` | 智能搜索开关（对应 `search_enabled`） |
-| `showThinking` | 是否展开思考全文；`false`（默认）折叠为单行摘要 |
-| `model` | `deepseek-chat` / `deepseek-reasoner` |
-| `userAgent` | 登录时捕获的浏览器 UA，所有请求复用 |
-| `wasmUrl` | PoW WASM 地址（上游更新后需替换） |
-| `apiBase` | 默认 `https://chat.deepseek.com/api/v0` |
-| `clientVersion` / `clientPlatform` / `clientLocale` | 对应 `x-client-*` 请求头 |
-| `proxy` | 可选，`http://` 或 `socks5://`，用于绕过 WAF 区域限制 |
-| `requestIntervalMs` | 两次上游请求的最小间隔，默认 1200ms（保守限速） |
-| `maxToolSteps` | 单轮最多工具调用轮数，默认 25 |
-| `contextMode` | `reuse`（默认，复用网页会话只发增量）或 `replay`（每轮打包完整历史 + 一次性会话） |
-
----
-
-## 4. 命令与快捷键
-
-| 命令 | 说明 |
-|------|------|
-| `/help` | 帮助 |
-| `/login`（或直接输入 `login`） | 用 Edge 拉起浏览器登录，抓取 token 并**校验通过后才保存** |
-| `/logout`（或直接输入 `logout`） | 清除本地凭证 |
-| `/thinking [on\|off]` | 切换深度思考；无参数则反转 |
-| `/search [on\|off]` | 切换智能搜索；无参数则反转 |
-| `/thinking-view [on\|off]` | 展开 / 折叠思考内容（快捷键 `Ctrl+O`）；无参数则反转 |
-| `/model [id]` | 查看 / 切换模型 |
-| `/lang [zh\|en]` | 查看 / 切换界面语言 |
-| `/system-prompt [edit\|reset]` | 查看 / 编辑 / 重置系统提示词 |
-| `/new` | 新建会话（网页会话在首次发送提示词时才创建） |
-| `/session` | 查看当前会话 |
-| `/session all` | 列出全部会话（按最近使用排序，`*` 标记当前） |
-| `/session <序号\|id前缀>` | 切换到指定会话：**同时切换工作目录与网页会话** |
-| `/clear` | 重置当前会话上下文（下次发送会新建网页会话） |
-| `/status` | 查看配置目录、模型、开关，并**真实校验凭证**（token 长度 + 指纹 + 接口结果） |
-| `/quit` | 退出 |
-
-`!` 前缀 = **直接执行 shell 命令**（输出只打印，不进入对话上下文）：
-
-```text
-❯ !git status --short
-  ! git status --short
-   M src/agent/repl.ts
-  ⎿  exit 0 (0.8s)
-```
-
-快捷键：`Ctrl+T` 切深度思考，`Ctrl+S` 切智能搜索，`Ctrl+O` 展开 / 折叠思考内容，
-`Ctrl+C` 中断生成（空闲时退出）。输入以 `!` 开头时提示符会由 `❯` 变成 `!`，模式一眼可辨。
-
-### 界面
-
-```text
-  ██████╗ ███████╗ ██████╗
-  ██╔══██╗██╔════╝ ██╔══██╗   DSP  (deepseek-pi)          ← 极简头部：只有字形
-  ██║  ██║███████╗ ██████╔╝   ✓ 已登录 · token 64 字符     ← 与登录状态两行
+  ██████╗ ███████╗ ██████╗   DSP  (deepseek-pi)
+  ██╔══██╗██╔════╝ ██╔══██╗   已登录 · token 64 字符
+  ██║  ██║███████╗ ██████╔╝
   ██║  ██║╚════██║ ██╔═══╝
   ██████╔╝███████║ ██║
   ╚═════╝ ╚══════╝ ╚═╝
 
-❯ 读取 src/index.ts                          ← 自研行编辑器（历史/光标/CJK 宽度）
+❯ 同时读取 package.json 和 tsconfig.json，各用一句话概括
 
-  ⠹ 思考 1.2s                                ← 思考中：spinner + 思考 + 实时耗时（默认不展示正文）
-  ▌ 思考 2.1s · 128 字 · Ctrl+O 展开          ← 结束后折叠为一行摘要，点击它即可展开
+  ✻ 思考 1.2s · 128 字
 
-  ▌ read  package.json                       ← 并行批次：调用一次性全部列出
+  ▌ 思考 2.4s · 431 字 · Ctrl+O 展开
+    （折叠状态只占一行，Ctrl+O 或点块头展开全文）
+
+  ▌ read  package.json
   ▌ read  tsconfig.json
-  └ read  package.json · 35 行 · 806B    7ms ← 结果按「完成顺序」打印
-  └ read  tsconfig.json · 22 行 · 509B   5ms ← 耗时右对齐；多工具时带工具名
-  · 2 个工具并行  ·  19ms                    ← 批次汇总（串行需 12ms）
+  └ read    package.json · 28 行 · 806B  7ms
+  └ read    tsconfig.json · 24 行 · 611B  5ms
+  · 2 个工具并行  ·  8ms
 
-  · 39 tokens  · 3.4s                        ← 本轮 token 用量 + 总耗时
+  两个文件分别描述……
 
-! git status --short                         ← "!" 进入 shell 命令模式（提示符变色）
-   M src/agent/repl.ts
-  └ exit 0                                0.8s
+  · 715 tokens  ·  119.2 tok/s  ·  6.0s
 
-❯ /                                          ← 输入 "/" 弹出全部命令面板
-▸ /session /search /status /system-prompt    ← 提示行（实时补全）
-◆ 新会话 (生成中 5.2s…) · deepseek-chat · 思考 关 · 搜索 开 · zh  ← 状态栏（固定底部）
+◆ 概括两个配置文件的用途 · deepseek-chat · Ctrl+T 深度思考 开 · Ctrl+S 智能搜索 关 · zh
 ```
 
-- **底部固定状态栏**：提示行 + 状态栏两行通过终端滚动区域（DECSTBM）钉在屏幕底部，
-  主输出在它上方滚动，**不会把状态栏顶走**。
-- **尺寸自适应**：终端缩放 / 全屏时重建滚动区域，并把光标**重新锚定到底部**，
-  面板与输入行一起落到新位置——不会出现「输入行跑到顶部」。
-- **换行一律回列**（输出互相覆盖的根因）：raw 模式下 `\n` 只换行、不回列
-  （Windows 上 libuv 会设 `DISABLE_NEWLINE_AUTO_RETURN`）。若某行不先 `\r` 归位，
-  光标会把上一行的列偏移带进下一行：输出整体右移，长行折行越过滚动区域底边后整屏开始互相覆盖。
-  现在主输出统一走 `info()`（写前归位并锚定），输入行提交也改为 `\r\n`。
-- **输入行紧贴状态栏上方**：启动时把光标定位到滚动区域底部，因此 `❯` 输入行始终位于
-  提示行（分隔线）与状态栏的正上方，输出内容在它上方逐行堆积。
-- **自研行编辑器**：不再使用 `node:readline`。readline 刷新输入行时会发出「擦除到屏幕末尾」
-  (`ESC[0J`)，会把底部状态栏一起擦掉，也无法做命令面板。自研编辑器只清当前输入行
-  (`ESC[2K`)，支持历史上下翻、Ctrl+A/E/U/K/W、Home/End、中文宽度感知与超长横向滚动。
-- **输入 `/` 显示全部命令**：立刻把命令面板（含中英文说明）打印到输出区；
-  继续输入如 `/s` 会实时筛选，提示行显示 `▸ /session /search /status /system-prompt`。
-- **工具并行执行**：一轮里的多个调用同时跑（`Promise.all`），总耗时取决于最慢的那个而非累加；
-  结果按**完成顺序**打印、按**调用顺序**回灌模型，多工具时结果行前缀工具名。
-- **不用 emoji**：字形只用块元素与制表符（`▌` 调用 · `└` 结果 · `·` 元信息），
-  避免终端把符号渲染成彩色表情而破坏列对齐。
-- **工具配色**：`read` 青 · `write` 绿 · `list` 蓝 · `exec` 黄 · `search` 品红；
-  工具名定宽对齐成一列，结果行耗时右对齐到终端最右。
-- **思考不展示正文（默认）**：思考期间只显示一行活动指示
-  `⠹ 思考 1.2s`（`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏` 旋转，90ms 刷新），结束时就地定稿为
-  `▌ 思考 2.1s · 128 字 · Ctrl+O 展开`。
-- **点击折叠**：点击块头即可展开 / 再次点击收起。思考全文与 **exec 输出**都是可折叠块
-  （exec 输出超过 6 行默认收起）。键盘等价操作是 `Ctrl+O`（只对最近一次思考）。
-- **结果摘要更有信息量**：`read` 带行数与体积、`list` 带条目数、`search` 带匹配数、
-  `exec` 带退出码与耗时。
-- **块式渲染器**：滚动区域里的历史行无法单独擦除，所以主输出在写入终端的同时也记入缓冲区；
-  折叠时按新的折叠状态重排可见窗口并逐行绝对定位重绘（`src/ui/renderer.ts`）。
-  长行会按当前宽度硬折成多段，保证「一个逻辑行 = 一个屏幕行」，命中映射因此是精确的。
-- **鼠标支持**：启用 SGR 鼠标跟踪（`?1000h ?1006h`）解析 `\x1b[<b;x;yM` 精确坐标，
-  退出时关闭以恢复终端的原生拖选行为。若不想用鼠标，`Ctrl+O` 同样可以切换最近一个块。
-- **耗时可视化**：工具结果附带执行耗时（`49ms` / `3.4s`），每轮结束显示 token 用量与总耗时；
-  生成期间状态栏每秒刷新已耗时（`◆ 新会话 (生成中 5.2s…)`）。
-- **`!` 命令模式**：以 `!` 开头的输入直接交给 shell 执行，输出原样打印、**不进入对话上下文**；
-  正在输入 `!` 时提示符由 `❯` 变成 `!`。
-- **头部极简**：启动头部只保留 DSP 字形 + 登录状态两行，其余信息用 `/status` 查看。
-- **Windows 中文输出**：子进程输出先按 UTF-8 解码，出现替换字符时自动回退 GBK
-  （cmd 中文代码页 936），避免 `!` / `exec` 的中文结果变成乱码。
-- **降级**：非 TTY（管道、重定向）或设置环境变量 `PI_UI=plain` 时自动退化为普通逐行输出；
-  管道模式支持一次投喂多行（含 `!` 命令），且流提前结束时不会挂起。
-
-```powershell
-$env:PI_UI = "plain"   # 关闭固定状态栏与面板
-```
-
-### 会话与上下文（重要）
-
-**pi 会话 ↔ 网页会话是 1:1 绑定的**，一个本地会话对应一个 `chat.deepseek.com` 上的会话。
-
-| 环节 | 行为 |
-|------|------|
-| `/new` 新建会话 | 只写本地 `sessions/<id>.json`，**不在网页端建会话** |
-| 首次发送提示词 | 才真正调用 `/chat_session/create`，拿到 `deepseekSessionId` 并落盘（**懒创建**） |
-| 后续发送 | 复用同一个 `chat_session_id`，并把上一轮的 `response_message_id` 作为 `parent_message_id` 链式追加 |
-| `/session all` | 列出全部会话；`/session <序号>` 切换后，**工作目录与网页会话同时切换** |
-| `/clear` | 清空本地消息并解绑网页会话，下次发送会新建一个网页会话 |
-
-**保证一个 pi 会话只对应一个网页会话。** 为此修掉了三条会产生「多余会话」的路径：
-
-1. **回合失败/中断时绑定丢失**：之前只有流正常跑完才把 `deepseekSessionId` 落盘，
-   一旦中途出错（限流、网络、Ctrl+C），下一轮会误以为还没建会话而重新创建，
-   旧会话就留在了网页端。现在改为在 `finally` 中**无条件落盘**。
-2. **凭证校验产生孤儿会话**：`/status`、`/login` 之前用「创建会话 + 删除会话」来校验 token，
-   一旦删除失败就会留下空会话。现在改用**纯读取**的 `GET /users/current`，零副作用。
-3. **空会话残留**：本轮由客户端新建、但完全没跑起来（PoW 失败、PoW 之前就异常）的会话，
-   会在 `finally` 中被立即删除并解绑。
-
-**上下文不需要"压缩后打包重发"。** 既然会话是 1:1 的，就直接复用网页会话、每轮只发**增量**，历史由服务端保存：
-
-- 系统提示词 + 工具说明**只在会话的第一条消息**下发一次（判据是 `parentMessageId == null`），之后不再重复；
-- 工具执行结果作为下一条消息回灌，前缀为 `[工具结果]`；
-- 好处：token 消耗从 O(轮数²) 降到 O(轮数)，且网页端能看到与终端一致的完整对话。
-
-> `contextMode: "replay"` 是兜底方案：每轮把完整历史重新拼成 DeepSeek 原生 ChatML prompt，发到**一次性会话**里用完即删（即上游 API 服务的做法）。它最稳，但 token 消耗随轮数平方增长，且**不满足 1:1 绑定**（网页端只会看到一堆临时会话）。只有在 `reuse` 模式遇到上游行为异常时才切过去。
-
----
-
-## 5. 工具调用
-
-请求中会注入**精简**的工具说明（随语言切换），模型以「独占一行」的文本格式调用工具：
-
-```text
-write:"文件内容",文件路径      # 一次性完整写入（非追加）
-read:文件路径
-list:目录路径
-exec:命令
-search:关键词
-```
-
-`src/tools/parser.ts` 负责解析（容忍全角冒号、引号包裹、`\n` 等转义）；解析失败会把错误回灌给模型让它自我修正。相对路径以**当前工作目录**为基准。
-
----
-
-## 6. 依赖变更说明
-
-**新增（本项目的全部运行时依赖）：**
-
-| 依赖 | 用途 |
-|------|------|
-| `playwright` | `/login` 拉起可见浏览器并读取 LocalStorage |
-| `undici` | 仅在配置了 `proxy` 时用于 `ProxyAgent`；未配置则不加载 |
-
-**开发依赖：** `typescript`、`@types/node`、`tsx`。
-
-**相对 `pi` 移除的依赖（及其能力）：**
-
-- `@earendil-works/*`（`pi-ai` / `pi-agent-core` / `pi-tui` / `chord` 等）——多供应商抽象与自研 TUI 全部去掉，改为内置单供应商 + 自研行编辑器与底部状态栏。
-- `photon-node`、`grok-mermaid`、`highlight.js`、`typebox`、`proper-lockfile`、`semver`、`yaml`、`diff`、`minimatch`、`ignore`、`hosted-git-info`、`cross-spawn`、`chalk`、`jiti` —— 图像处理、Mermaid 渲染、代码高亮、JSON Schema 校验、包管理、云同步/遥测等非核心能力全部去掉；配色改为内置 ANSI 实现。
-
-**相对 `deepseek-reverse-api` 移除的运行形态：** 不再需要单独部署 Python 服务、它的配置文件与 Web 管理面板，DeepSeek 调用逻辑以 TS 模块内嵌在同一个进程里。
-
----
-
-## 7. 构建与运行
+## 构建
 
 ```bash
-npm run typecheck   # 仅类型检查
-npm run build       # tsc -> dist/
-npm start           # node dist/index.js
-npm run dev         # tsx 直接运行源码
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+
+cd rust
+cargo build --release            # 产物：rust/target/release/dsp
+./target/release/dsp --selftest  # 自检：打印机器指纹并尝试解开已有凭证（不联网）
+./target/release/dsp             # 交互模式
 ```
 
-`package.json` 的 `bin.dsp` 指向 `dist/index.js`，`npm link` 后可直接用 `dsp` 命令。
+依赖全是纯 Rust（`reqwest`+rustls / `ratatui` / `crossterm` / `wasmi` / `aes-gcm` / `scrypt`），
+**不需要 openssl-dev，也不需要 build-essential**。首次编译约 2–4 分钟。
 
----
+想全局用：`cargo install --path rust`，或
+`sudo ln -s "$PWD/rust/target/release/dsp" /usr/local/bin/dsp`。
 
-## 8. 架构与数据流
+## 登录
+
+不做浏览器自动化，token 由你提供，三条路径：
+
+```bash
+dsp /login <userToken>          # 直接带 token
+dsp                             # 进去后输入 /login，在界面里粘贴
+DSP_TOKEN=<userToken> dsp       # 环境变量
+```
+
+token 取自 `chat.deepseek.com` 的 LocalStorage（key 是 `userToken`）。
+加密格式固定不变，所以磁盘上已有的凭证可以直接复用 —— `--selftest` 就是确认这件事的。
+
+## 快捷键
+
+| 按键 | 作用 |
+|------|------|
+| `Enter` | 发送 |
+| `Esc` | 退出；有选区时先取消选区；登录输入中则取消登录 |
+| `Ctrl+C` | 中断生成；有选区时改为「复制选区」 |
+| `右键` | 复制选区 |
+| `Ctrl+T` / `Ctrl+S` | 深度思考 / 智能搜索（状态栏常驻显示当前值） |
+| `Ctrl+O` | 展开或收起最近一个块（思考、exec 输出） |
+| `Ctrl+↑` / `Ctrl+↓` | 跳到历史顶部 / 回到底部 |
+| `滚轮` / `PgUp` / `PgDn` | 翻历史 |
+| `左键拖动` | 选择文本（反显） |
+| `左键单击块头` | 折叠 / 展开该块 |
+
+## 命令
+
+```
+/help /login /logout /thinking /search /thinking-view /model /lang
+/status /sessions /session /clear /goto /system-prompt /quit
+```
+
+`!<命令>` 直接跑 shell，输出只打印、**不进对话上下文**（不消耗 token）：
 
 ```text
-用户输入
-   │
-   ▼
-Agent 循环 (src/agent/loop.ts)
-   │  buildPrompt(历史 + 系统提示词 + 工具说明)   ← src/deepseek/prompt.ts
-   ▼
-DeepSeek 编排 (src/deepseek/provider.ts)
-   │  ① create_session
-   │  ② create_pow_challenge → WASM 求解 → x-ds-pow-response
-   │  ③ POST /chat/completion（SSE）
-   │  ④ 逐块解析 → StreamEvent（think / content / done）
-   │  ⑤ stop_stream + delete_session（清理）
-   ▼
-文本工具调用解析 (src/tools/parser.ts)
-   │  write / read / list / exec / search
-   ▼
-工具执行 (src/tools/*) → 结果回灌为 <｜tool▁outputs▁begin｜> 段
-   │
-   └──► 无工具调用 → 本轮结束
+❯ !git status --short
+  ▌ git status --short
+   M rust/src/ui.rs
+  └ exit 0  0.8s
 ```
 
----
+`/goto` 弹出提示词选择框（↑/↓ 选、Enter 跳转），`/goto 3` 直接跳第 3 条。
+`/system-prompt` 看当前提示词，`edit` 用 `$EDITOR` 打开，`reset` 恢复默认。
 
-## 9. 已知风险与后续可改进点
+## 几个实现上的选择
 
-### 风险
+- **工具并行执行**：一轮里模型可以同时发多个调用（`Promise.all` 的 Rust 版：`std::thread` + `join`），
+  总耗时取决于最慢的那个而非累加；结果按**完成顺序**打印、按**调用顺序**回灌模型。
+- **思考折叠**：默认只占一行，`Ctrl+O` 展开回放全文。思考块**一定排在正文上面** ——
+  正文是按行实时推给界面的，所以思考在「正文开始的那一刻」就收尾。
+- **不发 tokio**：`reqwest::blocking` + 一个后台线程 + `mpsc`，界面线程只管画。
+- **身份**：系统提示词里的身份是 `Pi-Agent`；被问到「你是谁 / 叫什么」时统一回答 `deepseek`。
+- **会话名**：首条提示词回车即作为标题顶掉「新会话」，首轮结束后再向网页端取它自动起的名字覆盖。
 
-1. **TLS 指纹不等于真实浏览器**：上游参考实现做了浏览器 TLS 指纹模拟（这是它能稳定绕过 WAF 的关键之一），而 Node 的 `fetch`（undici）无法做到。若上游风控收紧到 TLS 层，请求可能被拒。**缓解**：配置非美国地区的 HTTP 代理（`config.json` 的 `proxy`），并保持保守的 `requestIntervalMs`。
-2. **WASM PoW 地址会变**：`wasmUrl` 中的 hash 由上游静态资源版本决定，上游发版后可能失效。**缓解**：报错信息会明确提示更新 `wasmUrl`；未硬编码 `__wbindgen_export_0`，而是按名称动态探测导出。
-3. **JS 无法按函数签名筛选 WASM 导出**：上游实现所用的 WASM 运行时可以按函数签名匹配导出，而 JS 的 `WebAssembly` API 只能按名称探测；本实现退化为「按名称 + 除已知符号外唯一函数」策略，兼容性略低于上游，但仍是动态探测、不硬编码符号名。
-4. **网页版接口属非公开接口**：字段（`fragments`、`p/o/v`、`biz_code`）随时可能变更，本项目对已知错误码做了中文提示，但无法覆盖全部情况。
-5. **账号风控**：DeepSeek 对网页端有 session 级限流，累计请求过多可能被临时禁言。**缓解**：默认 1200ms 间隔 + 流式请求失败指数退避重试；建议个人低频使用。
-6. **`exec` 工具可执行任意命令**：与所有编码 Agent 相同，仅在可信目录使用。
-7. **`Ctrl+S` 在极少数终端可能被当作流控（XOFF）**：readline 已处于 raw 模式，通常无影响；若失效请改用 `/search on|off`。
-8. **上下文由服务端保存**：`reuse` 模式下历史存在 DeepSeek 服务端。若你在网页端手动删除了该会话，本地的 `parentMessageId` 会失效 → 用 `/clear` 重新开始即可。
-9. **凭证文件存在 ≠ 已登录**：`auth/deepseek-web.json` 只是一个加密容器。若你手动放入了无效 token，程序会认为"已登录"但请求会返回 `40003`。现在 `/login` 会先校验再落盘，`/status` 也可随时做真实校验；聊天时若收到 `40003`，会自动清掉本地凭证并提示重新登录。
-10. **PoW 依赖 `expire_at` 字段**：服务端返回的是 snake_case（`expire_at` / `target_path`），
-    必须在客户端映射为内部 camelCase，否则拼接出的 prefix 会变成 `salt_undefined_`，
-    WASM 永远求不出解（表现为「WASM 未求出解」）。该映射已在 `client.createPowChallenge` 中处理，
-    并在字段缺失时直接报错而不是继续发请求。
+## 已知限制
 
-### 故障排查
+- 折行按字符数而非显示宽度，含大量中文的长行折行点会偏一点（不影响功能）
+- 会话只有一层（`sessions/<id>.json` 列表），没有分页浏览
+- PoW 需要联网下载官方 sha3 WASM，首次请求会慢一下；之后进程内缓存
+- 不做浏览器自动化登录，token 需手工提供
 
-| 现象 | 原因 / 处理 |
-|------|-------------|
-| `PoW 计算失败：WASM 未求出解` | 挑战字段映射异常（已修复）或 `wasmUrl` 过期 → 更新 `config.json` 的 `wasmUrl` |
-| `凭证校验：✘ 40003` | token 失效 → `logout` 后重新 `login` |
-| 请求被 202 拦截 | CloudFront WAF（美国 IP）→ 配置 `proxy` |
-| 界面错乱 / 状态栏异常 | 终端不支持滚动区域 → `$env:PI_UI="plain"` |
+## 历史
 
-### 可改进点
-
-- **会话复用**：改用 `edit_message` + 复用 `chat_session_id`，减少往返并利用服务端上下文缓存。
-- **自动发现 `wasmUrl`**：抓取 `chat.deepseek.com` 首页 JS，正则提取最新的 `sha3_wasm_bg.*.wasm`，免去手改配置。
-- **增量历史压缩**：`reuse` 模式已把上下文交给服务端；`replay` 回退时可参考上游的「历史文件上传」策略分块。
-- **更强的 TLS 拟真**：接入支持 TLS 指纹自定义的 HTTP 客户端（如 `curl-impersonate` 包装）。
-- **工具扩展**：当前严格保留 5 个核心工具；如需 `edit`（局部替换）可基于 `write` + diff 实现。
-- **多账号轮转**：上游的账号池能力未移植（单用户单账号场景下无必要）。
-- **流式工具调用的增量解析**：目前等整段回答结束再解析工具调用；可在流式过程中提前识别并打断，降低延迟。
-
----
-
-## 10. 许可
-
-仅供个人学习研究使用。DeepSeek 官方 API 价格低廉，请优先支持官方服务。
+早期是一份等价的 TypeScript 实现（Node + 自研行编辑器 + DECSTBM 滚动区域），
+现已删除并在 Rust 版里重写，配置目录 `~/.pi/agent` 与凭证格式完全沿用。
+需要那份代码的话看 git 历史（`2b25748` 及之前）。

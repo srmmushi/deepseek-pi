@@ -60,7 +60,7 @@ DSP (deepseek-pi) —— 终端编程助手，仅使用 DeepSeek 网页版
     /login                 在界面里粘贴 token（回车确认，Esc 取消）
     DSP_TOKEN=<token> dsp  从环境变量注入
   token 取自 chat.deepseek.com 的 LocalStorage（key 为 userToken）。
-  加密方案与 TS 版一致，所以 TS 版写下的凭证可以直接复用。";
+  加密格式与历史版本一致，磁盘上已有的凭证可以直接复用。";
 
 #[derive(Default)]
 struct Args {
@@ -655,8 +655,8 @@ fn command(input: &str, core: &mut Core, app: &mut App) {
     }
 }
 
-/// 保存一份 token。Rust 版不做浏览器自动化，token 由用户提供
-/// （粘贴 / 环境变量 / 复用 TS 版写下的凭证，两边加密格式一致）。
+/// 保存一份 token。本程序不做浏览器自动化，token 由用户提供
+/// （粘贴 / 环境变量 / 直接复用磁盘上已有的凭证，加密格式未变）。
 fn do_login(core: &mut Core, app: &mut App, token: &str) {
     if token.trim().is_empty() {
         app.line_styled("token 为空，未保存。", ui::warn());
