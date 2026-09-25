@@ -30,7 +30,8 @@ import {
 export interface TurnIO {
 	onThinkStart(): void;
 	onThinkDelta(text: string): void;
-	onThinkEnd(): void;
+	/** 思考结束；fullText 为本次思考全文，供折叠后按需展开回放 */
+	onThinkEnd(fullText: string, elapsedMs: number): void;
 	onContentStart(): void;
 	onContentDelta(text: string): void;
 	/** 一批工具即将并行执行（calls.length >= 1） */
@@ -117,6 +118,16 @@ export async function runTurn(
 		let pendingLine = "";
 		let thinkOpen = false;
 		let contentStarted = false;
+		/** 本次思考的全文与起始时间（用于折叠摘要） */
+		let thinkText = "";
+		let thinkStartedAt = Date.now();
+
+		/** 结束思考段（内容开始或本轮结束时都会调用） */
+		const closeThink = (): void => {
+			if (!thinkOpen) return;
+			thinkOpen = false;
+			io.onThinkEnd(thinkText, Date.now() - thinkStartedAt);
+		};
 
 		/** 输出一行正文；工具调用行由界面用 ⏺ 单独渲染，这里吞掉避免重复 */
 		const emitLine = (line: string): void => {
@@ -145,16 +156,16 @@ export async function runTurn(
 				switch (evt.type) {
 					case "think_start":
 						thinkOpen = true;
+						thinkText = "";
+						thinkStartedAt = Date.now();
 						io.onThinkStart();
 						break;
 					case "think_delta":
+						thinkText += evt.content;
 						io.onThinkDelta(evt.content);
 						break;
 					case "content_start":
-						if (thinkOpen) {
-							thinkOpen = false;
-							io.onThinkEnd();
-						}
+						closeThink();
 						break;
 					case "content_delta": {
 						assistantText += evt.content;
@@ -173,10 +184,7 @@ export async function runTurn(
 							emitLine(pendingLine);
 							pendingLine = "";
 						}
-						if (thinkOpen) {
-							thinkOpen = false;
-							io.onThinkEnd();
-						}
+						closeThink();
 						lastFinishReason = evt.finishReason;
 						if (evt.usage != null) {
 							totalUsage += evt.usage;

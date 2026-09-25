@@ -226,6 +226,11 @@ export class App {
 		this.save();
 	}
 
+	setShowThinking(value: boolean): void {
+		this.config.showThinking = value;
+		this.save();
+	}
+
 	/** 切换模型：同时把「默认思考状态」应用到当前开关 */
 	setModel(modelId: string): boolean {
 		const model = findModel(modelId);

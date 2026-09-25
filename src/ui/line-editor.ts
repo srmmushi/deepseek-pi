@@ -140,7 +140,9 @@ export class LineEditor {
 	}
 
 	private submit(line: string): void {
-		process.stdout.write("\n");
+		// 必须用 \r\n：raw 模式下 \n 不回列，直接用 \n 会把输入行的列偏移
+		// 带进后续输出，导致输出整体右移并最终折行覆盖状态栏。
+		process.stdout.write("\r\n");
 		this.active = false;
 		if (line.trim()) {
 			this.history.push(line);
@@ -153,7 +155,7 @@ export class LineEditor {
 	}
 
 	private finishWithNull(): void {
-		process.stdout.write("\n");
+		process.stdout.write("\r\n");
 		this.active = false;
 		const resolve = this.resolver;
 		this.resolver = undefined;

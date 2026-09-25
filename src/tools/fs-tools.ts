@@ -1,6 +1,7 @@
 // 文件系统类工具：write / read / list / search
 import { promises as fs } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { formatBytes } from "../ui/text.js";
 import type { ToolContext, ToolResult } from "./types.js";
 
 /** 单次读取的最大字符数 */
@@ -58,7 +59,7 @@ export async function runWrite(
 		return {
 			ok: true,
 			output: ctx.i18n.t("tool.writeDone", { path: args.path, bytes }),
-			summary: args.path,
+			summary: ctx.i18n.t("tool.sumWrite", { path: args.path, size: formatBytes(bytes) }),
 		};
 	} catch (e) {
 		return { ok: false, output: `write 失败：${(e as Error).message}`, summary: args.path };
@@ -82,6 +83,8 @@ export async function runRead(args: { path: string }, ctx: ToolContext): Promise
 			return { ok: false, output: `${args.path} 疑似二进制文件，无法读取`, summary: args.path };
 		}
 		let text = buffer.toString("utf8");
+		// 行数按截断前的完整内容统计
+		const lineCount = text.split("\n").length;
 		let truncated = false;
 		if (text.length > MAX_READ_CHARS) {
 			text = text.slice(0, MAX_READ_CHARS);
@@ -92,7 +95,11 @@ export async function runRead(args: { path: string }, ctx: ToolContext): Promise
 		return {
 			ok: true,
 			output: `${header}${text}${footer}`,
-			summary: args.path,
+			summary: ctx.i18n.t("tool.sumRead", {
+				path: args.path,
+				lines: lineCount,
+				size: formatBytes(buffer.byteLength),
+			}),
 		};
 	} catch (e) {
 		return { ok: false, output: `read 失败：${(e as Error).message}`, summary: args.path };
@@ -129,7 +136,10 @@ export async function runList(args: { path: string }, ctx: ToolContext): Promise
 		return {
 			ok: true,
 			output: `[list] ${display(ctx.cwd, abs)}\n${rows.join("\n")}${more}`,
-			summary: display(ctx.cwd, abs),
+			summary: ctx.i18n.t("tool.sumList", {
+				path: display(ctx.cwd, abs),
+				count: Math.min(entries.length, MAX_LIST_ENTRIES),
+			}),
 		};
 	} catch (e) {
 		return { ok: false, output: `list 失败：${(e as Error).message}`, summary: args.path };
@@ -173,7 +183,11 @@ export async function runSearch(args: { query: string }, ctx: ToolContext): Prom
 	}
 
 	if (matches.length === 0) {
-		return { ok: true, output: `未找到包含 "${args.query}" 的内容`, summary: args.query };
+		return {
+			ok: true,
+			output: `未找到包含 "${args.query}" 的内容`,
+			summary: ctx.i18n.t("tool.sumSearchNone", { query: args.query }),
+		};
 	}
 	const tail =
 		matches.length >= MAX_SEARCH_MATCHES
@@ -182,6 +196,6 @@ export async function runSearch(args: { query: string }, ctx: ToolContext): Prom
 	return {
 		ok: true,
 		output: `[search] ${args.query}\n${matches.join("\n")}${tail}`,
-		summary: args.query,
+		summary: ctx.i18n.t("tool.sumSearch", { query: args.query, count: matches.length }),
 	};
 }

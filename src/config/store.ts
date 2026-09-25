@@ -14,6 +14,12 @@ export interface AppConfig {
 	thinking: boolean;
 	/** 是否开启智能搜索（对应 DeepSeek search_enabled） */
 	search: boolean;
+	/**
+	 * 是否展开显示思考全文。
+	 * false（默认）= 折叠：思考期间只显示单行实时指示，结束后留一行摘要；
+	 * true = 展开：思考内容逐字流式显示。
+	 */
+	showThinking: boolean;
 	/** 当前模型 id：deepseek-chat | deepseek-reasoner */
 	model: string;
 	/** 登录时捕获的浏览器 User-Agent（所有请求复用） */
@@ -68,6 +74,7 @@ export function defaultConfig(): AppConfig {
 		language: detectLang(),
 		thinking: false,
 		search: true,
+		showThinking: false,
 		model: MODELS[0].id,
 		userAgent: DEFAULT_USER_AGENT,
 		wasmUrl: DEFAULT_WASM_URL,

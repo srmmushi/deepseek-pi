@@ -1,6 +1,6 @@
 // 斜杠命令实现
 //
-// 覆盖：/help /login /logout /thinking /search /model /lang
+// 覆盖：/help /login /logout /thinking /search /thinking-view /model /lang
 //       /system-prompt /new /session /clear /status /quit
 import type { App } from "../app.js";
 import { modelIds } from "../app.js";
@@ -204,6 +204,21 @@ export async function handleCommand(
 			const next = parsed ?? !app.config.search;
 			app.setSearch(next);
 			out.print(t("toggle.search", { state: next ? t("status.on") : t("status.off") }));
+			return HANDLED;
+		}
+
+		case "/thinking-view":
+		case "/think-view": {
+			const parsed = parseOnOff(args);
+			if (args && parsed === undefined) {
+				out.print(t("toggle.unknownArg"));
+				return HANDLED;
+			}
+			const next = parsed ?? !app.config.showThinking;
+			app.setShowThinking(next);
+			out.print(
+				t("toggle.thinkingView", { state: next ? t("status.on") : t("status.off") }),
+			);
 			return HANDLED;
 		}
 

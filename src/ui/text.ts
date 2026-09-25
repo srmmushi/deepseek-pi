@@ -41,6 +41,22 @@ export function padTo(text: string, width: number): string {
 	return pad > 0 ? text + " ".repeat(pad) : text;
 }
 
+/** 把字节数格式化为紧凑体积（512B / 1.2KB / 3.4MB） */
+export function formatBytes(bytes: number): string {
+	if (bytes < 1024) return `${bytes}B`;
+	if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
+	return `${(bytes / 1024 / 1024).toFixed(1)}MB`;
+}
+
+/** 把「左内容 …… 右内容」拼成一行，TTY 下把右侧对齐到终端最右 */
+export function alignRight(left: string, right: string): string {
+	const width = process.stdout.isTTY ? (process.stdout.columns ?? 80) : 0;
+	if (width <= 0) return `${left} ${right}`;
+	const pad = width - displayWidth(left) - displayWidth(right) - 1;
+	if (pad < 2) return `${left} ${right}`;
+	return `${left}${" ".repeat(pad)}${right}`;
+}
+
 /** 把毫秒格式化为紧凑时长（7ms / 640ms / 3.4s / 1m02s） */
 export function formatDuration(ms: number): string {
 	const clamped = Math.max(0, ms);

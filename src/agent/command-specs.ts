@@ -28,6 +28,12 @@ export const COMMAND_SPECS: CommandSpec[] = [
 	{ name: "/clear", zh: "重置当前会话上下文", en: "Reset current session context" },
 	{ name: "/thinking", args: "[on|off]", zh: "深度思考开关（Ctrl+T）", en: "Toggle deep thinking (Ctrl+T)" },
 	{ name: "/search", args: "[on|off]", zh: "智能搜索开关（Ctrl+S）", en: "Toggle smart search (Ctrl+S)" },
+	{
+		name: "/thinking-view",
+		args: "[on|off]",
+		zh: "展开 / 折叠思考内容（Ctrl+O）",
+		en: "Expand / collapse thinking text (Ctrl+O)",
+	},
 	{ name: "/model", args: "[id]", zh: "查看 / 切换模型", en: "Show / switch model" },
 	{ name: "/lang", args: "[zh|en]", zh: "查看 / 切换界面语言", en: "Show / switch UI language" },
 	{
