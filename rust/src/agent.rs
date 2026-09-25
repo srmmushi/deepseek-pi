@@ -7,13 +7,13 @@
 //! 而回调结束后调用方还要读回「本轮正文 / 思考全文」，
 //! 所以用一个 `Arc<Mutex<Assembled>>` 在两边共享。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
 use crate::config::{AppConfig, ContextMode, Lang};
 use crate::deepseek::{
-    load_pow_solver, stream_chat_with_retry, DeepSeekClient, PowSolver, WebSessionHandle,
+    load_pow_solver, stream_chat_with_retry, DeepSeekClient, DsError, PowSolver, WebSessionHandle,
 };
 use crate::i18n::tr;
 use crate::prompt::{build_tool_doc, tool_result_prefix};
@@ -25,12 +25,6 @@ use crate::tools::{describe_call, execute_tool, parse_tool_calls, ToolCall, Tool
 pub enum UiEvent {
     /// 追加一行普通文本（不可折叠）
     Line(String),
-    /// 追加可折叠块
-    Block {
-        head: String,
-        body: Vec<String>,
-        collapsed: bool,
-    },
     /// 思考开始（UI 起 spinner 计时）
     ThinkStart,
     /// 思考进度（只传字数，spinner 由 UI 绘制）
@@ -52,26 +46,60 @@ pub enum UiEvent {
     Notice(String),
     /// 致命错误（已翻译成可读文案）
     Error(String),
+    /// 凭证失效，界面应清掉本地凭证
+    AuthFailed,
     /// 本轮请求处理完毕（无论成败）
     Finished,
 }
 
-/// 会话状态（内存态）
-#[derive(Debug, Default, Clone)]
+/// 会话状态，落盘在 <config>/sessions/<id>.json
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Session {
+    pub id: String,
     pub title: String,
     pub cwd: PathBuf,
     pub handle: WebSessionHandle,
+    /// (role, content)，role 取 user / assistant / tool
     pub messages: Vec<(String, String)>,
+    pub updated_at: u64,
 }
 
 impl Session {
     pub fn new(cwd: PathBuf, title: &str) -> Self {
+        let now = crate::auth::now_ms();
         Self {
+            id: format!("{now:x}"),
             title: title.to_string(),
             cwd,
+            updated_at: now,
             ..Default::default()
         }
+    }
+
+    pub fn save(&self, dir: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(dir)?;
+        let text = serde_json::to_string_pretty(self).unwrap_or_default();
+        std::fs::write(dir.join(format!("{}.json", self.id)), format!("{text}\n"))
+    }
+
+    /// 按最近使用排序
+    pub fn list(dir: &Path) -> Vec<Session> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut out: Vec<Session> = entries
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+            .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+            .filter_map(|t| serde_json::from_str(&t).ok())
+            .collect();
+        out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        out
+    }
+
+    /// 取最近一次会话
+    pub fn latest(dir: &Path) -> Option<Session> {
+        Session::list(dir).into_iter().next()
     }
 }
 
@@ -103,25 +131,31 @@ struct Assembled {
     finish: Option<String>,
 }
 
-/// 把底层错误翻译成可读提示
-pub fn describe_error(lang: Lang, error: &str) -> String {
-    let lower = error.to_lowercase();
-    if lower.contains("waf") {
-        return tr(lang, "error.waf").to_string();
+/// 把底层错误翻译成可读提示；第二个返回值表示「凭证失效，需要重新登录」
+pub fn describe_error(lang: Lang, e: &DsError) -> (String, bool) {
+    if e.is_auth() {
+        return (tr(lang, "error.sessionExpired").to_string(), true);
     }
-    if lower.contains("40003") {
-        return tr(lang, "error.sessionExpired").to_string();
+    if e.is_rate_limit() {
+        return (tr(lang, "error.rateLimit").to_string(), false);
     }
-    if lower.contains("rate_limit") || lower.contains("1001") || lower.contains("1201") {
-        return tr(lang, "error.rateLimit").to_string();
+    if matches!(e, DsError::Waf) {
+        return (tr(lang, "error.waf").to_string(), false);
     }
+    let msg = e.to_string();
+    let lower = msg.to_lowercase();
     if lower.contains("pow") || lower.contains("wasm") {
-        return format!("{}：{error}", tr(lang, "error.pow"));
+        return (format!("{}：{msg}", tr(lang, "error.pow")), false);
     }
-    if lower.contains("请求失败") || lower.contains("connect") || lower.contains(" timed out") {
-        return format!("{}：{error}", tr(lang, "error.http"));
+    if lower.contains("请求失败") || lower.contains("connect") || lower.contains("timed out") {
+        return (format!("{}：{msg}", tr(lang, "error.http")), false);
     }
-    format!("{}：{error}", tr(lang, "error.apiChanged"))
+    (format!("{}：{msg}", tr(lang, "error.apiChanged")), false)
+}
+
+/// PoW WASM 下载/实例化失败（不是接口错误，单独措辞）
+fn describe_pow(lang: Lang, msg: &str) -> String {
+    format!("{}：{msg}", tr(lang, "error.pow"))
 }
 
 /// 构建本轮要发送的内容
@@ -172,10 +206,7 @@ fn ensure_solver(runtime: &AgentRuntime, tx: &Sender<UiEvent>) -> bool {
             true
         }
         Err(e) => {
-            let _ = tx.send(UiEvent::Error(describe_error(
-                runtime.lang,
-                &e.to_string(),
-            )));
+            let _ = tx.send(UiEvent::Error(describe_pow(runtime.lang, &e.to_string())));
             false
         }
     }
@@ -184,16 +215,6 @@ fn ensure_solver(runtime: &AgentRuntime, tx: &Sender<UiEvent>) -> bool {
 /// 工具调用的一行展示（`▌ read  package.json`）
 pub fn tool_call_line(call: &ToolCall) -> String {
     format!("▌ {:<6}{}", call.name().as_str(), describe_call(call))
-}
-
-/// 工具结果的一行展示（`└ read  package.json · 35 行 · 806B  11ms`）
-pub fn tool_result_line(tool: &str, result: &ToolResult, ms: u128, parallel: bool) -> String {
-    let name = if parallel {
-        format!("{:<6}", tool)
-    } else {
-        String::new()
-    };
-    format!("└ {name}{}  {}", result.summary, format_ms(ms))
 }
 
 /// 毫秒格式化为紧凑时长
@@ -336,7 +357,12 @@ pub fn run_turn(
         }
 
         if let Err(e) = stream_result {
-            let _ = tx.send(UiEvent::Error(describe_error(lang, &e.to_string())));
+            let (msg, auth) = describe_error(lang, &e);
+            let _ = tx.send(UiEvent::Error(msg));
+            if auth {
+                // 凭证失效：让界面提示并清掉本地凭证
+                let _ = tx.send(UiEvent::AuthFailed);
+            }
             break;
         }
 

@@ -357,22 +357,6 @@ impl SseParser {
     }
 }
 
-/// 从 ready 帧里解析 response_message_id
-pub fn parse_ready_message_id(frame: &str) -> Option<u64> {
-    for line in frame.split('\n') {
-        let trimmed = line.trim();
-        let Some(rest) = trimmed.strip_prefix("data:") else {
-            continue;
-        };
-        if let Ok(val) = serde_json::from_str::<Value>(rest.trim()) {
-            if let Some(id) = val.get("response_message_id").and_then(|v| v.as_u64()) {
-                return Some(id);
-            }
-        }
-    }
-    None
-}
-
 /// 判断错误是否可重试（限流 / 瞬时故障）
 pub fn is_retryable(error: &crate::deepseek::DsError) -> bool {
     use crate::deepseek::DsError;

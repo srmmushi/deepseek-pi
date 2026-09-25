@@ -16,7 +16,6 @@ use base64::Engine as _;
 use rand::RngCore;
 use scrypt::{scrypt, Params as ScryptParams};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 
 use crate::config::ConfigPaths;
 
@@ -177,11 +176,6 @@ pub fn clear_auth(paths: &ConfigPaths) -> bool {
     }
 }
 
-/// 是否已登录
-pub fn has_auth(paths: &ConfigPaths) -> bool {
-    load_auth(paths).is_some()
-}
-
 /// token 指纹（展示 / 排查用，不泄露原文）
 pub fn token_fingerprint(token: &str) -> String {
     // 简单求和哈希即可，仅用于人眼比对
@@ -191,11 +185,6 @@ pub fn token_fingerprint(token: &str) -> String {
         h = h.wrapping_mul(1099511628211);
     }
     format!("{h:016x}")
-}
-
-/// 从文件读出凭证（供 /status 判断文件是否存在）
-pub fn auth_file_exists(paths: &ConfigPaths) -> bool {
-    paths.auth_file.exists()
 }
 
 /// 提示：手工粘贴 token（Rust 版不做浏览器自动化）
@@ -215,9 +204,4 @@ pub fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
-}
-
-/// 便捷：判断某路径下的凭证是否可解密
-pub fn auth_readable(paths: &ConfigPaths) -> bool {
-    Path::new(&paths.auth_file).exists() && load_auth(paths).is_some()
 }

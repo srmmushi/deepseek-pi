@@ -4,7 +4,6 @@
 //!   write:"内容",路径     read:路径     list:目录     exec:命令     search:关键词
 
 use crate::config::Lang;
-use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -626,7 +625,4 @@ pub fn execute_tool(call: &ToolCall, cwd: &Path, lang: Lang) -> ToolResult {
     }
 }
 
-/// 把 JSON 数组（模型可能返回的结构化工具调用）也认出来（预留）
-pub fn is_json_tool_array(value: &Value) -> bool {
-    value.is_array()
-}
+

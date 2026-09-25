@@ -602,7 +602,7 @@ impl DeepSeekClient {
 // ── completion 编排 ─────────────────────────────────────────
 
 /// 网页会话句柄（复用模式）
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct WebSessionHandle {
     pub session_id: Option<String>,
     pub parent_message_id: Option<u64>,

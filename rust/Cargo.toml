@@ -13,15 +13,13 @@ path = "src/main.rs"
 # TUI
 ratatui = "0.29"
 crossterm = "0.28"
-# HTTP（blocking + 后台线程 + mpsc，刻意不引入 tokio）
-#
-# 用 native-tls 而不是 rustls-tls：rustls 依赖 ring，ring 的构建脚本要调用
-# MinGW 的 ar/cc，而它在含中文的路径下会乱码失败（ar: ...No such file or directory）。
-# native-tls 在 Windows 上走系统 schannel，纯 FFI，不需要编译任何 C 代码。
+# HTTP。用 blocking + 后台线程 + mpsc，不引入 tokio。
+# TLS 用 rustls：纯 Rust，不依赖系统的 openssl 开发包，Debian/Ubuntu 系的
+# WSL 里开箱即用（native-tls 那套要另外装 libssl-dev）。
 reqwest = { version = "0.12", default-features = false, features = [
     "blocking",
     "json",
-    "native-tls",
+    "rustls-tls",
 ] }
 # 序列化
 serde = { version = "1", features = ["derive"] }
