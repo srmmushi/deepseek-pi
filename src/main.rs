@@ -42,6 +42,7 @@ DSP (deepseek-pi) —— 终端编程助手，仅使用 DeepSeek 网页版
       --resume              接着最近一次会话继续
       --selftest            只做自检：打印机器指纹并尝试解密已保存的凭证
       --info                只打印环境信息（同 /info）后退出，不进界面
+      --grab                只扫描浏览器存储并报告诊断；找到凭证就顺手保存
   -h, --help                显示本帮助
 
 快捷键
@@ -108,6 +109,8 @@ struct Args {
     resume: bool,
     selftest: bool,
     info: bool,
+    /// 只扫描浏览器存储并报告诊断结果（找到凭证就顺手保存）
+    grab: bool,
     help: bool,
 }
 
@@ -119,6 +122,7 @@ fn parse_args(argv: &[String]) -> Args {
             "--help" | "-h" => args.help = true,
             "--selftest" => args.selftest = true,
             "--info" => args.info = true,
+            "--grab" => args.grab = true,
             "--resume" => args.resume = true,
             "--config-dir" | "-c" => {
                 if let Some(v) = argv.get(i + 1) {
@@ -148,6 +152,9 @@ fn main() {
     }
 
     let paths = config::resolve_paths(args.config_dir.as_deref());
+    if args.grab {
+        std::process::exit(grab(&paths));
+    }
     if args.info {
         // 与 /info 同一份内容，但不需要进 TUI —— 也方便贴到 bug 报告里
         let config = config::load_config(&paths);
@@ -165,6 +172,75 @@ fn main() {
         cleanup_terminal();
         eprintln!("启动失败：{e}");
         std::process::exit(1);
+    }
+}
+
+/// `--grab`：扫描浏览器存储并如实汇报看到了什么；找到凭证就顺手保存。
+///
+/// 登录不成功时先跑它。输出里能直接区分三种原因：
+/// 目录根本没找到（路径假设错了）、目录在但键名一次没出现（键名或 profile 不对）、
+/// 键名出现了却提取不出值（记录被 snappy 压过 / 值布局与预期不同，看「键后字节」）。
+fn grab(paths: &ConfigPaths) -> i32 {
+    let probes = browser::probe();
+    if probes.is_empty() {
+        println!("没找到任何浏览器的 Local Storage 目录。");
+        println!("可能原因：");
+        println!("  · 浏览器从没访问过 chat.deepseek.com（先登录一次）");
+        println!("  · 浏览器装在 Windows 那边，而 /mnt/c/Users 读不到");
+        println!("  · C 盘不是挂在 /mnt/c（有些 WSL 配置会改）");
+        return 1;
+    }
+
+    let mut found: Option<(String, String)> = None;
+    for p in &probes {
+        println!("{}  {}", p.browser, p.dir.display());
+        println!(
+            "   文件        .log {} 个 · .ldb {} 个 · 共 {} 字节",
+            p.log_files, p.ldb_files, p.bytes
+        );
+        println!(
+            "   userToken   出现 {} 次 · chat.deepseek.com {}",
+            p.key_hits,
+            if p.origin_hit { "出现" } else { "未出现" }
+        );
+        for sample in &p.samples {
+            println!("   键后字节    {sample}");
+        }
+        match &p.token {
+            Some(token) => {
+                println!(
+                    "   提取结果    成功（{} 字符 · 指纹 {}）",
+                    token.chars().count(),
+                    auth::token_fingerprint(token)
+                );
+                if found.is_none() {
+                    found = Some((p.browser.clone(), token.clone()));
+                }
+            }
+            None => println!("   提取结果    没找到"),
+        }
+        println!();
+    }
+
+    match found {
+        Some((who, token)) => {
+            let ua = config::load_config(paths).user_agent;
+            match auth::save_token_from_input(paths, &token, &ua) {
+                Ok(_) => {
+                    println!("登录成功！（凭证来自 {who}，已写入 {}）", paths.auth_file.display());
+                    0
+                }
+                Err(e) => {
+                    println!("凭证已提取，但保存失败：{e}");
+                    1
+                }
+            }
+        }
+        None => {
+            println!("没提取到凭证。把上面的输出发我 —— 看「userToken 出现几次」和");
+            println!("「键后字节」就能确定是键名不对，还是记录被压缩了。");
+            2
+        }
     }
 }
 

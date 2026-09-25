@@ -141,6 +141,89 @@ fn read_capped(path: &Path) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// localStorage 里存 userToken 用的键名
+const TOKEN_KEY: &[u8] = b"userToken";
+/// 本站域名（键名前不远处应该出现它）
+const TOKEN_ORIGIN: &[u8] = b"chat.deepseek.com";
+
+/// 一次扫描的诊断结果。
+/// 登录不成功时先看它 —— 路径不对 / 键名不对 / 记录被压缩，三种原因一眼能分。
+pub struct Probe {
+    pub browser: String,
+    pub dir: PathBuf,
+    pub log_files: usize,
+    pub ldb_files: usize,
+    pub bytes: u64,
+    /// 文件里出现 `userToken` 的次数
+    pub key_hits: usize,
+    /// 文件里是否出现本站域名
+    pub origin_hit: bool,
+    pub token: Option<String>,
+    /// 键名后面那一段原始字节（可打印化），用来判断值的真实布局
+    pub samples: Vec<String>,
+}
+
+/// 扫一遍并如实汇报「看到了什么」
+pub fn probe() -> Vec<Probe> {
+    let mut out = Vec::new();
+    for (name, dir) in leveldb_dirs() {
+        let logs = files_by_ext(&dir, "log");
+        let ldbs = files_by_ext(&dir, "ldb");
+        let mut probe = Probe {
+            browser: name,
+            dir: dir.clone(),
+            log_files: logs.len(),
+            ldb_files: ldbs.len(),
+            bytes: 0,
+            key_hits: 0,
+            origin_hit: false,
+            token: None,
+            samples: Vec::new(),
+        };
+        // 顺序与 extract_user_token 一致：先写入日志，再落盘的表文件
+        for file in logs.iter().chain(ldbs.iter()) {
+            let Ok(bytes) = read_capped(file) else { continue };
+            probe.bytes += bytes.len() as u64;
+            probe.key_hits += count_of(&bytes, TOKEN_KEY);
+            probe.origin_hit |= find(&bytes, TOKEN_ORIGIN).is_some();
+            if probe.token.is_none() {
+                probe.token = find_token(&bytes);
+            }
+            if probe.samples.len() < 3 {
+                if let Some(s) = sample_after_key(&bytes) {
+                    probe.samples.push(s);
+                }
+            }
+        }
+        out.push(probe);
+    }
+    out
+}
+
+fn count_of(haystack: &[u8], needle: &[u8]) -> usize {
+    let mut count = 0;
+    let mut from = 0;
+    while let Some(at) = find(&haystack[from..], needle) {
+        count += 1;
+        from += at + needle.len();
+    }
+    count
+}
+
+/// 把键名后面那 96 字节按可打印形式取出（诊断用）。
+/// 值的真实布局（有没有标记字节、token 多长）看这一段就清楚了。
+fn sample_after_key(bytes: &[u8]) -> Option<String> {
+    let at = find(bytes, TOKEN_KEY)?;
+    let start = at + TOKEN_KEY.len();
+    let end = (start + 96).min(bytes.len());
+    Some(
+        bytes[start..end]
+            .iter()
+            .map(|b| if b.is_ascii_graphic() { *b as char } else { '.' })
+            .collect(),
+    )
+}
+
 /// 在字节流里找 `userToken` 并取出它后面的值。
 ///
 /// localStorage 记录的布局大致是：
@@ -157,15 +240,15 @@ fn find_token(bytes: &[u8]) -> Option<String> {
     const KEY: &[u8] = b"userToken";
     const ORIGIN: &[u8] = b"chat.deepseek.com";
     let mut from = 0;
-    while let Some(at) = find(&bytes[from..], KEY) {
+    while let Some(at) = find(&bytes[from..], TOKEN_KEY) {
         let start = from + at;
         let window = start.saturating_sub(48);
-        if find(&bytes[window..start], ORIGIN).is_some() {
-            if let Some(token) = token_at(bytes, start + KEY.len()) {
+        if find(&bytes[window..start], TOKEN_ORIGIN).is_some() {
+            if let Some(token) = token_at(bytes, start + TOKEN_KEY.len()) {
                 return Some(token);
             }
         }
-        from = start + KEY.len();
+        from = start + TOKEN_KEY.len();
     }
     None
 }
