@@ -26,6 +26,8 @@ pub struct Hit {
     /// 文件里是否出现本站域名
     pub origin: bool,
     pub token: Option<String>,
+    /// 命中点之后 120 字节的可打印原文（最多 3 条），取不到凭证时用它定位
+    pub traces: Vec<String>,
 }
 
 /// 扫遍所有候选目录
@@ -38,6 +40,7 @@ pub fn scan() -> Vec<Hit> {
             key_hits: 0,
             origin: false,
             token: None,
+            traces: Vec::new(),
         };
         // 先写入日志（新记录都在这儿、且不压缩），再落盘的表文件
         let mut files = files_by_ext(&dir, "log");
@@ -48,6 +51,16 @@ pub fn scan() -> Vec<Hit> {
             hit.origin |= find(&bytes, ORIGIN).is_some();
             if hit.token.is_none() {
                 hit.token = token_in(&bytes);
+            }
+            if hit.traces.len() < 3 {
+                let mut from = 0;
+                while hit.traces.len() < 3 {
+                    let Some(at) = find(&bytes[from..], KEY) else {
+                        break;
+                    };
+                    hit.traces.push(trace_after(&bytes, from + at));
+                    from += at + KEY.len();
+                }
             }
         }
         out.push(hit);
@@ -264,31 +277,64 @@ fn token_in(bytes: &[u8]) -> Option<String> {
     None
 }
 
-/// 键名之后的字节里取 token
-fn token_after(rest: &[u8]) -> Option<String> {
-    let head = &rest[..rest.len().min(640)];
-    match head.first() {
-        // 0 = 值按 UTF-16LE 存（token 本身是 ASCII，但浏览器偶尔会这么存）
-        Some(0) => {
-            let units: Vec<u16> = head[1..]
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                .collect();
-            pick(&String::from_utf16_lossy(&units))
-        }
-        // 1 = Latin-1
-        Some(1) => pick(std::str::from_utf8(&head[1..]).ok()?),
-        _ => pick(std::str::from_utf8(head).ok()?),
-    }
+/// 命中点之后 120 字节的可打印原文（非可打印字符显示成 '.'）。
+/// 只在 --grab 里打出来用 —— 取不到凭证时，看一眼就知道值的布局长什么样。
+fn trace_after(bytes: &[u8], at: usize) -> String {
+    let start = (at + KEY.len()).min(bytes.len());
+    let end = (start + 120).min(bytes.len());
+    bytes[start..end]
+        .iter()
+        .map(|b| if (0x20..0x7f).contains(b) { *b as char } else { '.' })
+        .collect()
 }
 
-/// 从一段文本里挑出 token：优先 JSON 的 value 字段，其次按裸 token 兜底
-fn pick(text: &str) -> Option<String> {
-    if let Some(token) = json_value(text) {
-        return Some(token);
+/// 键名之后的字节里取 token。
+///
+/// 键和值之间隔多少字节是不固定的，不能写死：
+///   · `.ldb` 表块是 `[长度][键][值]`，值紧跟键
+///   · `.log` 写入日志是 `[crc][长度][类型][键长][键][值长][值]`，
+///     键和值之间还夹着一个变长长度字段
+///   · 值本身可能带一个编码标记字节（0 = UTF-16LE，1 = Latin-1）
+///
+/// 所以不猜偏移：从键后往前试几个起点，找 JSON（形式最明确，不会认错），
+/// 找不到再退回裸 token。
+fn token_after(rest: &[u8]) -> Option<String> {
+    for skip in 0..12usize {
+        let Some(tail) = rest.get(skip..) else { break };
+        for text in decode(tail) {
+            if let Some(token) = json_value(&text) {
+                return Some(token);
+            }
+        }
     }
-    let bare: String = text.chars().take_while(|c| is_token_char(*c)).collect();
-    (bare.len() >= 16).then_some(bare)
+    for skip in 0..4usize {
+        let Some(tail) = rest.get(skip..) else { break };
+        for text in decode(tail) {
+            let bare: String = text.chars().take_while(|c| is_token_char(*c)).collect();
+            if bare.len() >= 32 {
+                return Some(bare);
+            }
+        }
+    }
+    None
+}
+
+/// 同一段字节按可能的编码各解一次
+fn decode(bytes: &[u8]) -> Vec<String> {
+    let head = &bytes[..bytes.len().min(1024)];
+    let mut out = Vec::new();
+    if let Ok(text) = std::str::from_utf8(head) {
+        out.push(text.to_string());
+    }
+    // 首位是 0 说明按 UTF-16LE 存
+    if head.first() == Some(&0) && head.len() > 8 {
+        let units: Vec<u16> = head[1..]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        out.push(String::from_utf16_lossy(&units));
+    }
+    out
 }
 
 /// 从 `"value":"<token>"` 里取值

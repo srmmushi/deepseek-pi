@@ -206,6 +206,9 @@ fn grab(paths: &ConfigPaths) -> i32 {
                 None => "未取到凭证".to_string(),
             }
         );
+        for trace in &hit.traces {
+            println!("  键后字节  {trace}");
+        }
         if found.is_none() {
             found = hit.token.as_ref().map(|t| (hit.browser.clone(), t.clone()));
         }
