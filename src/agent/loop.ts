@@ -33,8 +33,10 @@ export interface TurnIO {
 	onThinkEnd(): void;
 	onContentStart(): void;
 	onContentDelta(text: string): void;
-	onToolStart(call: ToolCall): void;
-	onToolEnd(call: ToolCall, result: ToolResult): void;
+	/** 一批工具即将并行执行（calls.length >= 1） */
+	onToolBatchStart(calls: ToolCall[]): void;
+	/** 单个工具执行结束；按完成顺序回调，index 为它在批次中的原始序号 */
+	onToolEnd(call: ToolCall, result: ToolResult, elapsedMs: number, index: number): void;
 	onDone(finishReason: string | null, usage: number | null): void;
 	onNotice(text: string): void;
 }
@@ -214,17 +216,29 @@ export async function runTurn(
 		// 没有工具调用 → 本轮结束
 		if (parsed.calls.length === 0) break;
 
-		// 依次执行工具（串行，避免相互干扰）
+		// 并行执行本批工具：互不依赖的调用同时跑，总耗时取决于最慢的那个。
+		// 回调顺序 = 完成顺序（体现真实并发）；回灌顺序 = 调用顺序（与模型的意图对齐）。
+		io.onToolBatchStart(parsed.calls);
+		const results = await Promise.all(
+			parsed.calls.map(async (call, index) => {
+				const startedAt = Date.now();
+				let result: ToolResult;
+				try {
+					result = await executeTool(call, toolCtx);
+				} catch (e) {
+					result = {
+						ok: false,
+						output: app.i18n.t("tool.crashed", { error: (e as Error).message }),
+						summary: describeCall(call),
+					};
+				}
+				io.onToolEnd(call, result, Date.now() - startedAt, index);
+				return result;
+			}),
+		);
+
 		const resultBlocks: string[] = [];
-		for (const call of parsed.calls) {
-			io.onToolStart(call);
-			let result: ToolResult;
-			try {
-				result = await executeTool(call, toolCtx);
-			} catch (e) {
-				result = { ok: false, output: `工具执行异常：${(e as Error).message}`, summary: describeCall(call) };
-			}
-			io.onToolEnd(call, result);
+		for (const result of results) {
 			const body = result.ok ? result.output : `[error] ${result.output}`;
 			resultBlocks.push(`${resultPrefix}\n${body}`);
 			session.messages.push({ role: "tool", content: body });

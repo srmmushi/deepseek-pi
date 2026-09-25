@@ -16,7 +16,7 @@
 import type { App } from "../app.js";
 import { isAuthError } from "../deepseek/provider.js";
 import { runShell } from "../tools/exec.js";
-import { describeCall } from "../tools/index.js";
+import { describeCall, type ToolCall, type ToolName } from "../tools/index.js";
 import { APP_FULL_NAME, APP_NAME, printBanner } from "../ui/banner.js";
 import { LineEditor, type EditorKey } from "../ui/line-editor.js";
 import { color, error as printError, info } from "../ui/output.js";
@@ -73,11 +73,23 @@ async function runShellLine(app: App, command: string): Promise<void> {
 	info(`  ${color.dim("⎿")}  ${state} ${color.dim(`(${formatDuration(result.durationMs)})`)}`);
 }
 
+/** 按工具类型配色，一眼区分「读 / 写 / 列目录 / 执行 / 搜索」 */
+const TOOL_COLOR: Record<ToolName, (text: string) => string> = {
+	read: color.cyan,
+	write: color.green,
+	list: color.blue,
+	exec: color.yellow,
+	search: color.magenta,
+};
+
 /** 构造本轮的渲染回调（Agent 风格：⏺ 工具 / ⎿ 结果 / ✻ 思考） */
 function createTurnIO(app: App): TurnIO {
 	const { t } = app.i18n;
 	const turnStartedAt = Date.now();
-	let toolStartedAt = turnStartedAt;
+	/** 当前并行批次 */
+	let batch: ToolCall[] = [];
+	let batchStartedAt = turnStartedAt;
+	let batchDone = 0;
 
 	return {
 		onThinkStart() {
@@ -95,16 +107,30 @@ function createTurnIO(app: App): TurnIO {
 		onContentDelta(text) {
 			process.stdout.write(text);
 		},
-		onToolStart(call) {
-			toolStartedAt = Date.now();
-			info(
-				`\n  ${color.magenta("⏺")} ${color.bold(call.name)}${color.dim(`(${describeCall(call)})`)}`,
-			);
+		// 批次开始：先把全部调用列出来，让「同时跑几个」一眼可见
+		onToolBatchStart(calls) {
+			batch = calls;
+			batchDone = 0;
+			batchStartedAt = Date.now();
+			info();
+			for (const call of calls) {
+				const paint = TOOL_COLOR[call.name] ?? color.magenta;
+				info(
+					`  ${paint("⏺")} ${paint(color.bold(call.name))}${color.dim(`(${describeCall(call)})`)}`,
+				);
+			}
 		},
-		onToolEnd(_call, result) {
+		// 完成顺序回调：谁先跑完谁先打印；多工具时带名字避免归属歧义
+		onToolEnd(call, result, elapsedMs) {
+			batchDone += 1;
 			const detail = result.ok ? color.dim(result.summary) : color.red(result.summary);
-			const cost = color.dim(`(${formatDuration(Date.now() - toolStartedAt)})`);
-			info(`  ${color.dim("⎿")}  ${detail} ${cost}`);
+			const label = batch.length > 1 ? color.dim(`${call.name} · `) : "";
+			info(`  ${color.dim("⎿")}  ${label}${detail} ${color.dim(`(${formatDuration(elapsedMs)})`)}`);
+			// 整批结束：补一行汇总，直观体现并行收益
+			if (batchDone >= batch.length && batch.length > 1) {
+				const span = color.dim(formatDuration(Date.now() - batchStartedAt));
+				info(`  ${color.dim(`· ${t("repl.parallel", { n: batch.length })}  ·  `)}${span}`);
+			}
 		},
 		onDone(_finishReason, usage) {
 			const parts: string[] = [];

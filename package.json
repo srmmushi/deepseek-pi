@@ -1,6 +1,6 @@
 {
 	"name": "deepseek-pi",
-	"version": "0.0.1-alpha",
+	"version": "0.0.2-alpha",
 	"description": "DSP (deepseek-pi) —— 终端编程助手，仅使用 DeepSeek 网页版（chat.deepseek.com），内置 Playwright 自动登录抓取 token。",
 	"type": "module",
 	"private": true,

@@ -30,6 +30,7 @@ const zhMessages = {
 	"repl.stopped": "（已中断）",
 	"repl.working": "正在处理…",
 	"repl.maxSteps": "已达到最大工具调用轮数（{max}），停止继续执行。",
+	"repl.parallel": "{n} 个工具并行",
 	"repl.emptyInput": "输入为空。",
 
 	// ── 登录 / 登出 ───────────────────────────────────────
@@ -59,6 +60,7 @@ const zhMessages = {
 	"tool.running": "→ 执行 {name}：{detail}",
 	"tool.ok": "✓ {name} 完成",
 	"tool.fail": "✗ {name} 失败：{error}",
+	"tool.crashed": "工具执行异常：{error}",
 	"tool.unknown": "未知工具：{name}",
 	"tool.maxOutput": "（输出已截断，仅显示前 {limit} 字符）",
 	"tool.writeDone": "已写入 {path}（{bytes} 字节）",
@@ -157,6 +159,7 @@ const enMessages: Record<MessageKey, string> = {
 	"repl.stopped": "(interrupted)",
 	"repl.working": "Working…",
 	"repl.maxSteps": "Reached the maximum number of tool rounds ({max}); stopping.",
+	"repl.parallel": "{n} tools in parallel",
 	"repl.emptyInput": "Empty input.",
 
 	"login.starting": "Launching browser, please wait…",
@@ -183,6 +186,7 @@ const enMessages: Record<MessageKey, string> = {
 	"tool.running": "→ running {name}: {detail}",
 	"tool.ok": "✓ {name} done",
 	"tool.fail": "✗ {name} failed: {error}",
+	"tool.crashed": "Tool crashed: {error}",
 	"tool.unknown": "Unknown tool: {name}",
 	"tool.maxOutput": "(output truncated, showing first {limit} chars)",
 	"tool.writeDone": "Wrote {path} ({bytes} bytes)",

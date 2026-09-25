@@ -41,9 +41,10 @@ export function padTo(text: string, width: number): string {
 	return pad > 0 ? text + " ".repeat(pad) : text;
 }
 
-/** 把毫秒格式化为紧凑时长（0.4s / 3.4s / 1m02s） */
+/** 把毫秒格式化为紧凑时长（7ms / 640ms / 3.4s / 1m02s） */
 export function formatDuration(ms: number): string {
 	const clamped = Math.max(0, ms);
+	if (clamped < 1000) return `${Math.round(clamped)}ms`;
 	if (clamped < 60_000) return `${(clamped / 1000).toFixed(1)}s`;
 	const total = Math.round(clamped / 1000);
 	return `${Math.floor(total / 60)}m${String(total % 60).padStart(2, "0")}s`;
