@@ -3,7 +3,7 @@
 终端编程助手。只通过 **DeepSeek 网页版**（`chat.deepseek.com`）推理，不依赖官方 API Key ——
 复刻网页端的鉴权与 PoW 流程，拿网页会话的 `userToken` 直接用。
 
-纯 Rust + Ratatui，约 4300 行，代码在 [`rust/`](rust)。
+纯 Rust + Ratatui，约 4300 行。
 
 ```text
   ██████╗ ███████╗ ██████╗   DSP  (deepseek-pi)
@@ -39,8 +39,7 @@
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source "$HOME/.cargo/env"
 
-cd rust
-cargo build --release            # 产物：rust/target/release/dsp
+cargo build --release            # 产物：target/release/dsp
 ./target/release/dsp --selftest  # 自检：打印机器指纹并尝试解开已有凭证（不联网）
 ./target/release/dsp             # 交互模式
 ```
@@ -48,8 +47,8 @@ cargo build --release            # 产物：rust/target/release/dsp
 依赖全是纯 Rust（`reqwest`+rustls / `ratatui` / `crossterm` / `wasmi` / `aes-gcm` / `scrypt`），
 **不需要 openssl-dev，也不需要 build-essential**。首次编译约 2–4 分钟。
 
-想全局用：`cargo install --path rust`，或
-`sudo ln -s "$PWD/rust/target/release/dsp" /usr/local/bin/dsp`。
+想全局用：`cargo install --path .`，或
+`sudo ln -s "$PWD/target/release/dsp" /usr/local/bin/dsp`。
 
 ## 登录
 
@@ -91,7 +90,7 @@ token 取自 `chat.deepseek.com` 的 LocalStorage（key 是 `userToken`）。
 ```text
 ❯ !git status --short
   ▌ git status --short
-   M rust/src/ui.rs
+   M src/ui.rs
   └ exit 0  0.8s
 ```
 
