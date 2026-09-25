@@ -38,7 +38,6 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ("/goto", "跳转到某条提示词", "jump to a prompt"),
     ("/thinking", "开关深度思考", "toggle thinking"),
     ("/search", "开关智能搜索", "toggle search"),
-    ("/thinking-view", "展开或折叠思考正文", "expand thinking"),
     ("/model", "查看或切换模型", "show or switch model"),
     ("/lang", "切换中英文", "switch language"),
     ("/status", "查看当前状态与各项路径", "show status"),

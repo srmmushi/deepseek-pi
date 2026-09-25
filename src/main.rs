@@ -55,7 +55,7 @@ DSP (deepseek-pi) —— 终端编程助手，仅使用 DeepSeek 网页版
 
 命令
   /help /login /logout /new /session /clear /goto /thinking /search
-  /thinking-view /model /lang /status /info /open /system-prompt /quit
+  /model /lang /status /info /open /system-prompt /quit
 
 会话
   /new               新建会话（清空上下文）
@@ -624,7 +624,7 @@ fn command(
         "/help" => {
             // 只讲界面里的命令；命令行参数（--config-dir 那些）用 `dsp --help` 看
             for line in HELP.lines().skip_while(|l| !l.starts_with("快捷键")) {
-                app.line(line);
+                app.line_styled(line.to_string(), help_style(line));
             }
         }
         "/info" => {
@@ -678,7 +678,9 @@ fn command(
             core.config.search = toggle(&arg).unwrap_or(!core.config.search);
             after_toggle(core, app, "toggle.search", core.config.search, false);
         }
-        "/thinking-view" => {
+        // /thinking-view 已取消，用户路径改走 Ctrl+O。
+        // 这条留作内部实现，免得 show_thinking / push_thinking 变成死代码。
+        "/__thinking-view" => {
             core.config.show_thinking = toggle(&arg).unwrap_or(!core.config.show_thinking);
             core.persist();
             let state = on_off(lang, core.config.show_thinking);
@@ -871,7 +873,7 @@ fn open_login_page(core: &mut Core, app: &mut App, rx: &mut Option<Receiver<UiEv
             match sysinfo::open_url(&list[i], SIGN_IN_URL, list[i].label.contains("Edge")) {
                 // Edge 用 --app 起独立窗口，登录页看起来就是个登录框
                 Ok(()) => {
-                    app.line_styled(format!("已用 {shown} 打开登录页，登录成功后凭证会自动读回来"), ui::ok());
+                    app.line_styled(format!("已用 {shown} 打开登录页"), ui::ok());
                 }
                 Err(e) => {
                     app.line_styled(format!("打开浏览器失败：{e}"), ui::err());
@@ -1068,10 +1070,33 @@ fn do_login(core: &mut Core, app: &mut App, token: &str) {
         Ok(saved) => {
             core.token = Some(saved.token);
             app.set_status(core.status_text());
-            app.line_styled(core.t("login.success"), ui::ok());
+            app.line_styled("登录成功！", ui::ok());
         }
         Err(e) => app.line_styled(format!("{}：{e}", core.t("login.failed")), ui::err()),
     }
+}
+
+/// /help 每一行的配色：段落标题加粗黄色，命令行青色，按键说明品红，其余灰。
+/// 输出区是按行着色的（一行一个样式），所以这里只能按整行来判断。
+fn help_style(line: &str) -> ratatui::style::Style {
+    use ratatui::style::{Color, Modifier, Style};
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Style::default();
+    }
+    // 段落标题：顶格、不以 / 开头
+    if line == trimmed && !trimmed.starts_with('/') {
+        return Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD);
+    }
+    if trimmed.starts_with('/') || trimmed.starts_with('!') {
+        return Style::default().fg(Color::Cyan);
+    }
+    if trimmed.contains("Ctrl+") || trimmed.contains("Enter") || trimmed.contains("Esc") {
+        return Style::default().fg(Color::Magenta);
+    }
+    Style::default().fg(Color::Gray)
 }
 
 /// 落地一个开关。

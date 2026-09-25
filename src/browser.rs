@@ -38,9 +38,6 @@ const BROWSERS: &[(&str, &str, &str, &str)] = &[
     ),
 ];
 
-/// 常见的配置目录名（一个人可能有多个 profile）
-const PROFILES: &[&str] = &["Default", "Profile 1", "Profile 2", "Profile 3"];
-
 /// 单个文件最多读这么多：`.ldb` 可能很大，而我们要找的记录通常在后段
 const MAX_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -69,11 +66,13 @@ fn leveldb_dirs() -> Vec<(String, PathBuf)> {
     let mut out = Vec::new();
     for (name, win, linux, mac) in BROWSERS {
         for root in user_data_roots(win, linux, mac) {
-            for profile in PROFILES {
-                let dir = root
-                    .join(profile)
-                    .join("Local Storage")
-                    .join("leveldb");
+            // 不写死 Default / Profile N：直接枚举根目录下所有子目录，
+            // 谁的 Local Storage/leveldb 在就算谁 —— 少见的 profile 名也不会漏
+            let Ok(entries) = std::fs::read_dir(&root) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let dir = entry.path().join("Local Storage").join("leveldb");
                 if dir.is_dir() {
                     out.push(((*name).to_string(), dir));
                 }
@@ -149,15 +148,24 @@ fn read_capped(path: &Path) -> std::io::Result<Vec<u8>> {
 /// 键和值在 LevelDB 的数据块里是紧挨着的（长度前缀在键前面），
 /// 所以找到键之后往后读一串 token 字符就行。
 fn find_token(bytes: &[u8]) -> Option<String> {
-    // 用完整的 localStorage 键，避免撞上别处同名的字符串
-    const KEY: &[u8] = b"chat.deepseek.com\0\x01userToken";
+    // 只认「键名本身」，但要求它前面不远处就是本站域名。
+    //
+    // 之前写死了 `chat.deepseek.com\0\x01userToken` 这个完整字节串，结果一个也
+    // 匹配不到：Chrome/Edge 在 origin 与键名之间插的标记字节各家版本并不一致
+    // （有的带 \x01、有的不带）。改成「键名前 48 字节内出现域名」既容错，
+    // 又不会把别处出现的同名字符串误当成 localStorage 记录。
+    const KEY: &[u8] = b"userToken";
+    const ORIGIN: &[u8] = b"chat.deepseek.com";
     let mut from = 0;
     while let Some(at) = find(&bytes[from..], KEY) {
-        let after_key = from + at + KEY.len();
-        if let Some(token) = token_at(bytes, after_key) {
-            return Some(token);
+        let start = from + at;
+        let window = start.saturating_sub(48);
+        if find(&bytes[window..start], ORIGIN).is_some() {
+            if let Some(token) = token_at(bytes, start + KEY.len()) {
+                return Some(token);
+            }
         }
-        from = after_key;
+        from = start + KEY.len();
     }
     None
 }
