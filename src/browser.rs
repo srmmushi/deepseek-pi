@@ -75,16 +75,53 @@ fn leveldb_dirs() -> Vec<(String, PathBuf)> {
     out
 }
 
-/// 遍历起点：本机用户目录，以及 WSL 下 Windows 那边的用户目录
-fn search_roots() -> Vec<PathBuf> {
+/// 遍历起点。
+///
+/// 要同时应付三种跑法：
+///   · Linux/macOS 原生二进制  → 家目录下的 .config / Application Support
+///   · Windows 原生二进制      → LOCALAPPDATA / USERPROFILE
+///   · Windows 二进制在 WSL 里跑（本项目的常规用法）→ 上面两个环境变量都可能是空的，
+///     但进程的当前目录是真实的 Windows 路径（C:\Users\me\Desktop\...），
+///     从它就能切出 C:\Users\me，进而找到 AppData\Local
+pub fn search_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
+
     if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        roots.push(PathBuf::from(local));
+        if !local.is_empty() {
+            roots.push(PathBuf::from(local));
+        }
+    }
+    if let Ok(profile) = std::env::var("USERPROFILE") {
+        if !profile.is_empty() {
+            roots.push(PathBuf::from(profile).join("AppData").join("Local"));
+        }
     }
     if let Some(home) = home() {
         roots.push(home.join(".config"));
         roots.push(home.join("Library").join("Application Support"));
     }
+
+    // 从当前目录反推：Windows 二进制在 WSL 里跑时，只有这条能拿到真实路径
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Some(home) = user_home_from(&cwd) {
+            let local = home.join("AppData").join("Local");
+            if local.is_dir() {
+                roots.push(local);
+            }
+        }
+        if let Some(drive) = drive_of(&cwd) {
+            if let Ok(entries) = std::fs::read_dir(format!("{drive}:\\Users")) {
+                for entry in entries.flatten() {
+                    let local = entry.path().join("AppData").join("Local");
+                    if local.is_dir() {
+                        roots.push(local);
+                    }
+                }
+            }
+        }
+    }
+
+    // WSL 原生二进制：Windows 盘挂在 /mnt/c
     if let Ok(entries) = std::fs::read_dir("/mnt/c/Users") {
         for entry in entries.flatten() {
             let local = entry.path().join("AppData").join("Local");
@@ -93,7 +130,31 @@ fn search_roots() -> Vec<PathBuf> {
             }
         }
     }
+
+    roots.sort();
+    roots.dedup();
     roots
+}
+
+/// 从 `C:\Users\srm木石\Desktop\x` 里切出 `C:\Users\srm木石`
+fn user_home_from(path: &Path) -> Option<PathBuf> {
+    const MARK: &str = ":\\Users\\";
+    let text = path.to_string_lossy();
+    // 不在小写串上取下标：那会和原串的字节长度对不上（比如土耳其语 İ）
+    let at = text.find(MARK).or_else(|| text.find(":\\users\\"))?;
+    let name = text[at + MARK.len()..].split(['\\', '/']).next()?;
+    if name.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(format!("{}:\\Users\\{}", &text[..at], name)))
+}
+
+/// 取路径的盘符（`C:\...` → `C`）
+fn drive_of(path: &Path) -> Option<char> {
+    let text = path.to_string_lossy();
+    let mut chars = text.chars();
+    let letter = chars.next()?;
+    (chars.next() == Some(':') && letter.is_ascii_alphabetic()).then_some(letter)
 }
 
 /// 有界遍历。只往可能相关的目录里钻，不会把整个盘走一遍。

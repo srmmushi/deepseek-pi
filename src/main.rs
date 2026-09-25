@@ -183,7 +183,14 @@ fn main() {
 fn grab(paths: &ConfigPaths) -> i32 {
     let hits = browser::scan();
     if hits.is_empty() {
-        println!("没找到浏览器的 Local Storage 目录（浏览器访问过 chat.deepseek.com 吗？）");
+        println!("没找到浏览器的 Local Storage 目录。找过这些起点：");
+        for root in browser::search_roots() {
+            println!(
+                "  [{}] {}",
+                if root.is_dir() { "有" } else { "无" },
+                root.display()
+            );
+        }
         return 1;
     }
 
