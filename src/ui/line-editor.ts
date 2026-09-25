@@ -40,6 +40,7 @@ export class LineEditor {
 	private historyIndex = -1;
 	private draft = "";
 	private pipeBuffer = "";
+	private pipeEnded = false;
 	private disposed = false;
 
 	constructor(options: LineEditorOptions) {
@@ -62,6 +63,13 @@ export class LineEditor {
 	/** 当前输入内容（未提交） */
 	get line(): string {
 		return this.buffer;
+	}
+
+	/** 动态切换提示符（例如输入 `!` 进入命令模式）；正在输入时立即重绘 */
+	setPrompt(prompt: string): void {
+		if (this.options.prompt === prompt) return;
+		this.options.prompt = prompt;
+		if (this.tty && this.active) this.render();
 	}
 
 	/** 读取一行；返回 null 表示 EOF 或用户请求退出 */
@@ -283,31 +291,57 @@ export class LineEditor {
 		this.render();
 	}
 
-	/** 非 TTY：按行读取 */
+	/** 非 TTY 下回显输入行 */
+	private emitPiped(line: string): void {
+		process.stdout.write(`${this.options.prompt}${line}\n`);
+	}
+
+	/** 非 TTY：按行读取（支持一次投喂多行、也支持流提前结束） */
 	private readLinePiped(): Promise<string | null> {
 		return new Promise<string | null>((resolve) => {
-			const onData = (chunk: Buffer): void => {
-				this.pipeBuffer += chunk.toString("utf8");
+			/** 缓冲区里有一整行就取出一行并 resolve；返回是否取到 */
+			const takeLine = (): boolean => {
 				const index = this.pipeBuffer.indexOf("\n");
-				if (index < 0) return;
+				if (index < 0) return false;
 				const line = this.pipeBuffer.slice(0, index).replace(/\r$/, "");
 				this.pipeBuffer = this.pipeBuffer.slice(index + 1);
 				cleanup();
-				process.stdout.write(`${this.options.prompt}${line}\n`);
+				this.emitPiped(line);
 				resolve(line);
+				return true;
 			};
+
+			const onData = (chunk: Buffer): void => {
+				this.pipeBuffer += chunk.toString("utf8");
+				takeLine();
+			};
+
 			const onEnd = (): void => {
-				cleanup();
+				this.pipeEnded = true;
+				// 先看是否还有完整行；没有的话，把最后一段无换行的内容当一行
+				this.pipeBuffer = this.pipeBuffer.replace(/\r?\n$/, "");
+				if (takeLine()) return;
 				const rest = this.pipeBuffer.trim();
 				this.pipeBuffer = "";
+				cleanup();
+				if (rest) this.emitPiped(rest);
 				resolve(rest ? rest : null);
 			};
+
 			const cleanup = (): void => {
 				process.stdin.off("data", onData);
 				process.stdin.off("end", onEnd);
 			};
+
+			// 流早已结束（上一轮读取期间）：直接消费缓冲区，避免再次挂起
+			if (this.pipeEnded) {
+				onEnd();
+				return;
+			}
 			process.stdin.on("data", onData);
 			process.stdin.on("end", onEnd);
+			// 数据可能在上一次 readLine 期间就已进入缓冲区，先尝试消费
+			takeLine();
 		});
 	}
 }

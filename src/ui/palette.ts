@@ -15,6 +15,13 @@ export function printCommandPalette(lang: Lang): void {
 		info(`  ${color.cyan(padTo(usageOf(spec), NAME_COLUMN))}${color.dim(describeOf(spec, lang))}`);
 	}
 	info();
+	// 非斜杠命令：! 前缀直接执行 shell
+	const shellDesc =
+		lang === "zh"
+			? "直接执行 shell 命令，例如 !git status"
+			: "Run a shell command, e.g. !git status";
+	info(`  ${color.yellow(padTo("!<command>", NAME_COLUMN))}${color.dim(shellDesc)}`);
+	info();
 }
 
 /** 生成底部提示行的补全文本（单行，超长由状态栏自行截断） */
