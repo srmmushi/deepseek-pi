@@ -174,41 +174,59 @@ impl PowSolver {
             .ok_or_else(|| anyhow!("PoW WASM 未导出 memory"))?;
 
         // 收集函数型导出名，用于「按名探测 + 唯一候选兜底」
-        let mut funcs: Vec<String> = Vec::new();
-        for export in module.exports() {
-            if matches!(export.ty(), wasmi::ExternType::Func(_)) {
-                funcs.push(export.name().to_string());
+        // 收集函数导出：名字 + 参数个数 + 返回值个数。
+        // 光有名字不够 —— 新版 wasm-bindgen 会把分配器导成 __wbindgen_export_N
+        // 这种与位置相关的名字，只有签名才靠得住。
+        let funcs: Vec<(String, usize, usize)> = module
+            .exports()
+            .filter_map(|export| match export.ty() {
+                wasmi::ExternType::Func(ty) => Some((
+                    export.name().to_string(),
+                    ty.params().into_iter().count(),
+                    ty.results().into_iter().count(),
+                )),
+                _ => None,
+            })
+            .collect();
+        let listing = || {
+            funcs
+                .iter()
+                .map(|f| format!("{}({}/{})", f.0, f.1, f.2))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+
+        // 先按名字找，名字对不上再按签名找 —— 且要求签名唯一，才敢认。
+        // 之前用「前缀是 __wbindgen_export_」兜底，很容易挑中 free 之类的函数，
+        // 参数个数不对、一调用就 trap，报出来就是「调用分配器失败」。
+        let pick = |want: &str, params: usize, results: usize| -> Option<String> {
+            if let Some(found) = funcs.iter().find(|f| f.0 == want) {
+                return Some(found.0.clone());
             }
-        }
+            let mut hits = funcs
+                .iter()
+                .filter(|f| f.1 == params && f.2 == results)
+                .map(|f| f.0.clone());
+            let first = hits.next()?;
+            hits.next().is_none().then_some(first)
+        };
 
-        let add_to_stack = funcs
-            .iter()
-            .find(|n| n.as_str() == "__wbindgen_add_to_stack_pointer")
-            .or_else(|| funcs.iter().find(|n| n.contains("add_to_stack")))
-            .cloned()
-            .ok_or_else(|| anyhow!("未找到 __wbindgen_add_to_stack_pointer 导出"))?;
-
-        let malloc = funcs
-            .iter()
-            .find(|n| n.as_str() == "__wbindgen_malloc")
-            .or_else(|| funcs.iter().find(|n| n.starts_with("__wbindgen_export_")))
-            .or_else(|| funcs.iter().find(|n| n.contains("malloc")))
-            .cloned()
-            .ok_or_else(|| anyhow!("未找到内存分配器导出（__wbindgen_malloc）"))?;
-
-        let mut solve = funcs
-            .iter()
-            .find(|n| n.as_str() == "wasm_solve")
-            .cloned();
-        if solve.is_none() {
-            // 兜底：排除已知符号后只剩一个函数，就认它
-            let known = [add_to_stack.as_str(), malloc.as_str(), "memory"];
-            let rest: Vec<&String> = funcs.iter().filter(|n| !known.contains(&n.as_str())).collect();
-            if rest.len() == 1 {
-                solve = Some(rest[0].clone());
-            }
-        }
-        let solve = solve.ok_or_else(|| anyhow!("未找到 wasm_solve 导出"))?;
+        // __wbindgen_malloc(size, align) -> ptr
+        let malloc = pick("__wbindgen_malloc", 2, 1)
+            .ok_or_else(|| anyhow!("未找到内存分配器 (i32,i32)->i32。现有导出：{}", listing()))?;
+        // __wbindgen_add_to_stack_pointer(delta) -> ptr
+        let add_to_stack = pick("__wbindgen_add_to_stack_pointer", 1, 1)
+            .ok_or_else(|| anyhow!("未找到栈指针函数 (i32)->i32。现有导出：{}", listing()))?;
+        let solve = pick("wasm_solve", 4, 0)
+            .or_else(|| {
+                // 名字也被改过时的兜底：排除已认出的两个，只剩一个就认它
+                let rest: Vec<&(String, usize, usize)> = funcs
+                    .iter()
+                    .filter(|f| f.0 != malloc && f.0 != add_to_stack && f.0 != "memory")
+                    .collect();
+                (rest.len() == 1).then(|| rest[0].0.clone())
+            })
+            .ok_or_else(|| anyhow!("未找到 wasm_solve。现有导出：{}", listing()))?;
 
         Ok(Self {
             store,
@@ -226,14 +244,16 @@ impl PowSolver {
             .instance
             .get_func(&self.store, &self.malloc)
             .ok_or_else(|| anyhow!("缺少分配器"))?;
+        let name = self.malloc.clone();
+        let size = data.len();
         let mut results = [wasmi::Val::I32(0)];
         malloc
             .call(
                 &mut self.store,
-                &[wasmi::Val::I32(data.len() as i32), wasmi::Val::I32(1)],
+                &[wasmi::Val::I32(size as i32), wasmi::Val::I32(1)],
                 &mut results,
             )
-            .context("调用分配器失败")?;
+            .with_context(|| format!("调用分配器 {name} 失败（传参 i32,i32 = {size},1）"))?;
         let ptr = match results[0] {
             wasmi::Val::I32(v) => v,
             _ => bail!("分配器返回值异常"),

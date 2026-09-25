@@ -782,9 +782,16 @@ impl App {
             ])),
             input_area,
         );
-        // 光标位置按提示符的实际宽度算，别写死 2
-        let offset = prompt.chars().count() as u16;
-        let x = (input_area.x + offset + self.cursor as u16)
+        // 光标列 = 提示符显示宽度 + 光标之前那段的显示宽度。
+        // 不能用字符个数：中文一个字占两列，用个数会让光标落在文字中间。
+        let prompt_width: usize = prompt.chars().map(App::char_width).sum();
+        let typed_width: usize = if self.login_mask {
+            // 掩码显示时全是 '*'，每个一列
+            self.cursor
+        } else {
+            self.input.chars().take(self.cursor).map(App::char_width).sum()
+        };
+        let x = (input_area.x + prompt_width as u16 + typed_width as u16)
             .min(input_area.right().saturating_sub(1));
         frame.set_cursor_position((x, input_area.y));
 

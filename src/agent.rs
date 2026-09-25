@@ -249,9 +249,6 @@ pub fn run_turn(
     // 累计的「纯生成」耗时，用于 token/s（工具执行的时间不算在内）
     let mut gen_ms: u128 = 0;
 
-    // 本轮是不是这次会话的第一轮（决定要不要去网页端取会话名）
-    let first_turn = session.messages.is_empty();
-
     session
         .messages
         .push(("user".to_string(), user_input.to_string()));
@@ -506,9 +503,9 @@ pub fn run_turn(
         }
     }
 
-    // 首轮跑完，去网页端把自动起的会话名取回来（界面从共享的 Session 读，
-    // 所以这里直接写 session 即可）。取不到就保留按提示词截断的标题。
-    if first_turn && session.messages.len() >= 2 {
+    // 会话名由服务端生成（网页端就是这么做的），本地不用提示词顶替。
+    // 首轮它可能还没起好名，所以只要标题还是默认值就每轮再问一次。
+    if session.title == "新会话" {
         if let Some(sid) = session.handle.session_id.clone() {
             if let Some(title) = runtime.client.session_title(&runtime.token, &sid) {
                 session.title = title;

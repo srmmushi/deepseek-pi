@@ -275,6 +275,8 @@ struct Core {
     total_tokens: u64,
     /// 最近一轮的生成速率（token/s），还没跑过就是 None
     last_rate: Option<f64>,
+    /// /logout 丢掉的那份凭证。浏览器存储里可能还留着，重新登录时要忽略它
+    discarded: Option<String>,
 }
 
 impl Core {
@@ -387,6 +389,7 @@ fn run(paths: ConfigPaths, resume: bool) -> anyhow::Result<()> {
         login_account: String::new(),
         total_tokens: 0,
         last_rate: None,
+        discarded: None,
     };
 
     let mut app = App::default();
@@ -594,17 +597,6 @@ fn label_of(text: &str) -> String {
     }
 }
 
-/// 会话标题：把提示词压平成一行，最多留 28 字
-fn title_of(text: &str) -> String {
-    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let chars: Vec<char> = flat.chars().collect();
-    if chars.len() > 28 {
-        format!("{}…", chars[..28].iter().collect::<String>())
-    } else {
-        flat
-    }
-}
-
 fn start_turn(core: &mut Core, app: &mut App, input: String, rx: &mut Option<Receiver<UiEvent>>) {
     if core.token.is_none() {
         app.line_styled(format!("! {}", core.t("app.notLoggedIn")), ui::warn());
@@ -618,15 +610,8 @@ fn start_turn(core: &mut Core, app: &mut App, input: String, rx: &mut Option<Rec
         }
     };
     *core.aborted.lock().unwrap() = false;
-    // 首条提示词就是这次会话的标题：回车之后，右下角的「新会话」立刻换成它
-    {
-        let mut session = core.session.lock().unwrap();
-        if session.messages.is_empty() {
-            session.title = title_of(&input);
-        }
-    }
-    core.session_title = core.session.lock().unwrap().title.clone();
-    app.set_status(core.status_text());
+    // 会话名交给服务端生成（和网页端一样），本地不拿提示词顶替；
+    // 首轮跑完会去取一次，取到再刷新状态栏
     app.set_busy(true);
 
     let (tx, receiver): (Sender<UiEvent>, Receiver<UiEvent>) = mpsc::channel();
@@ -891,11 +876,13 @@ fn command(
             }
         }
         "/logout" => {
+            // 记下丢掉的凭证：浏览器里可能还留着它，下次 /login 不能又读回来
+            core.discarded = core.token.clone();
             let removed = auth::clear_auth(&core.paths);
             core.token = None;
             app.set_status(core.status_text());
             app.line_styled(
-                if removed { "已清除本地凭证。" } else { "本地没有凭证。" },
+                if removed { "已退出登录。" } else { "本地没有凭证。" },
                 ui::dim(),
             );
         }
@@ -916,11 +903,15 @@ fn open_login_page(core: &mut Core, app: &mut App, rx: &mut Option<Receiver<UiEv
 
     // 1) 浏览器里已经登录过：直接拿来用，页面都不用开。
     //    这里不额外打字，成功提示统一由 do_login 给。
-    if let Some((who, token)) = browser::extract_user_token() {
-        do_login(core, app, &token);
-        // 凭证到手，浏览器不用留着了
-        sysinfo::close_browser(&who);
-        return;
+    // 刚 /logout 过就跳过这一步：浏览器里留着的正是刚丢弃的旧凭证，
+    // 一读回来就等于压根没退出
+    if core.discarded.is_none() {
+        if let Some((who, token)) = browser::extract_user_token() {
+            do_login(core, app, &token);
+            // 凭证到手，浏览器不用留着了
+            sysinfo::close_browser(&who);
+            return;
+        }
     }
 
     // 2) 没有就打开登录页（默认 Edge）
@@ -952,11 +943,16 @@ fn open_login_page(core: &mut Core, app: &mut App, rx: &mut Option<Receiver<UiEv
     // 3) 后台盯着浏览器存储，登录一完成就把 token 读回来
     let (tx, receiver): (Sender<UiEvent>, Receiver<UiEvent>) = mpsc::channel();
     *rx = Some(receiver);
+    let discarded = core.discarded.clone();
     std::thread::spawn(move || {
         // 每 2 秒扫一次，最多等 5 分钟
         for _ in 0..150 {
             std::thread::sleep(Duration::from_secs(2));
             if let Some((who, token)) = browser::extract_user_token() {
+                // 忽略 /logout 丢掉的那份，等真正重新登录后的新凭证
+                if discarded.as_deref() == Some(token.as_str()) {
+                    continue;
+                }
                 sysinfo::close_browser(&who);
                 let _ = tx.send(UiEvent::Token(token));
                 let _ = tx.send(UiEvent::Finished);
@@ -1126,6 +1122,7 @@ fn do_login(core: &mut Core, app: &mut App, token: &str) {
     match auth::save_token_from_input(&core.paths, token, &ua) {
         Ok(saved) => {
             core.token = Some(saved.token);
+            core.discarded = None;
             app.set_status(core.status_text());
             app.line_styled("登录成功！", ui::ok());
         }
