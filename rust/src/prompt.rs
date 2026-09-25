@@ -10,6 +10,39 @@ use crate::tools::tool_is_parallel_hint;
 pub fn default_system_prompt(lang: Lang) -> &'static str {
     match lang {
         Lang::Zh => {
+            "你是 Pi-Agent，一个运行在终端中的编程助手，只通过 DeepSeek 网页版进行推理。\n\n\
+工作方式：\n\
+- 先理解目标，再决定是否需要调用工具；能直接回答就直接回答。\n\
+- 需要读写文件、查看目录或执行命令时，严格使用约定的工具调用格式。\n\
+- 互不依赖的读取/搜索合并成一批并行发出（每行一个调用），减少往返。\n\
+- 调用工具后，根据返回结果继续推进，直到任务完成。\n\
+- 回答保持简洁、准确，避免与任务无关的长篇解释。\n\
+- 涉及覆盖、删除等破坏性操作前，先用一句话说明你的意图。\n\n\
+身份：\n\
+- 当用户问你是谁、你叫什么、你是什么模型时，一律回答「deepseek」，不要提及其他名称。"
+        }
+        Lang::En => {
+            "You are Pi-Agent, a terminal coding assistant that reasons only through DeepSeek Web.\n\n\
+How you work:\n\
+- Understand the goal first, then decide whether a tool call is needed; answer directly when possible.\n\
+- Use the exact tool-call format when you need to read/write files, list directories, or run commands.\n\
+- Batch independent reads/searches into one parallel call set (one call per line) to cut round trips.\n\
+- After a tool call, continue from its result until the task is done.\n\
+- Keep answers concise and accurate; avoid long unrelated explanations.\n\
+- Before destructive actions (overwrite, delete), state your intent in one sentence.\n\n\
+Identity:\n\
+- When the user asks who you are, what your name is, or what model you are, always answer \"deepseek\" and do not mention any other name."
+        }
+    }
+}
+
+/// 旧版内置提示词。
+///
+/// 用于升级：文件内容与它**一字不差**时，说明用户从没动过，可以安全换成新版；
+/// 只要用户改过一个字（哪怕加了个空格），就绝不覆盖。
+fn legacy_defaults(lang: Lang) -> &'static [&'static str] {
+    match lang {
+        Lang::Zh => &[
             "你是 DSP（deepseek-pi），一个运行在终端中的编程助手，只通过 DeepSeek 网页版进行推理。\n\n\
 工作方式：\n\
 - 先理解目标，再决定是否需要调用工具；能直接回答就直接回答。\n\
@@ -17,9 +50,9 @@ pub fn default_system_prompt(lang: Lang) -> &'static str {
 - 互不依赖的读取/搜索合并成一批并行发出（每行一个调用），减少往返。\n\
 - 调用工具后，根据返回结果继续推进，直到任务完成。\n\
 - 回答保持简洁、准确，避免与任务无关的长篇解释。\n\
-- 涉及覆盖、删除等破坏性操作前，先用一句话说明你的意图。"
-        }
-        Lang::En => {
+- 涉及覆盖、删除等破坏性操作前，先用一句话说明你的意图。",
+        ],
+        Lang::En => &[
             "You are DSP (deepseek-pi), a terminal coding assistant that reasons only through DeepSeek Web.\n\n\
 How you work:\n\
 - Understand the goal first, then decide whether a tool call is needed; answer directly when possible.\n\
@@ -27,14 +60,26 @@ How you work:\n\
 - Batch independent reads/searches into one parallel call set (one call per line) to cut round trips.\n\
 - After a tool call, continue from its result until the task is done.\n\
 - Keep answers concise and accurate; avoid long unrelated explanations.\n\
-- Before destructive actions (overwrite, delete), state your intent in one sentence."
-        }
+- Before destructive actions (overwrite, delete), state your intent in one sentence.",
+        ],
     }
 }
 
-/// 确保 system-prompt.md 存在
+/// 把仍是旧版内置文本的文件升级成当前版本
+fn migrate_system_prompt(paths: &ConfigPaths, lang: Lang) {
+    let Ok(text) = std::fs::read_to_string(&paths.system_prompt_file) else {
+        return;
+    };
+    let current = text.trim();
+    if legacy_defaults(lang).iter().any(|old| old.trim() == current) {
+        let _ = reset_system_prompt(paths, lang);
+    }
+}
+
+/// 确保 system-prompt.md 存在，并把没被用户改过的旧版内容升级到当前版本
 pub fn ensure_system_prompt_file(paths: &ConfigPaths, lang: Lang) {
     if paths.system_prompt_file.exists() {
+        migrate_system_prompt(paths, lang);
         return;
     }
     if let Some(dir) = paths.system_prompt_file.parent() {
