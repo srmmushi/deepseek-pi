@@ -52,16 +52,24 @@ cargo build --release            # 产物：target/release/dsp
 
 ## 登录
 
-不做浏览器自动化，token 由你提供，三条路径：
+四种方式，都是 `/login` 的子命令：
 
-```bash
-dsp /login <userToken>          # 直接带 token
-dsp                             # 进去后输入 /login，在界面里粘贴
-DSP_TOKEN=<userToken> dsp       # 环境变量
+```text
+/login            打开登录页（同 /login browser）
+/login token      手动粘贴 userToken（输入掩码显示）
+/login passwd     手机号 / 邮箱 + 密码（两步输入，密码掩码）
+/login wechatqr   微信扫码，二维码直接画在终端里
 ```
 
-token 取自 `chat.deepseek.com` 的 LocalStorage（key 是 `userToken`）。
+`/login browser` 用自动识别出的浏览器打开 `chat.deepseek.com/sign_in`：
+登录后在该页按 F12，控制台执行 `localStorage.getItem('userToken')`，再用 `/login token` 粘回来。
+`DSP_TOKEN=<token> dsp` 依然可用，`/login` 时会优先采用。
+
 加密格式固定不变，所以磁盘上已有的凭证可以直接复用 —— `--selftest` 就是确认这件事的。
+
+> `/login passwd` 与 `/login wechatqr` 依赖网页端的私有接口（DeepSeek 没有公开文档）。
+> 密码登录的 `/api/v0/users/login` 有第三方项目佐证；**微信扫码那个路径我没能核实**，
+> 属于按同类接口形状的推测。失败时两者都会把服务端原始响应打出来，照着改一行即可。
 
 ## 快捷键
 
@@ -83,7 +91,7 @@ token 取自 `chat.deepseek.com` 的 LocalStorage（key 是 `userToken`）。
 ```
 /help /login /logout /thinking /search /thinking-view /model /lang
 /status /sessions /session /clear /goto /system-prompt
-/info /browser /open /quit
+/info /open /quit
 ```
 
 ### 环境与浏览器
@@ -94,26 +102,18 @@ token 取自 `chat.deepseek.com` 的 LocalStorage（key 是 `userToken`）。
 环境信息
   程序版本    dsp 0.1.0 (release)
   操作系统    Ubuntu 24.04.1 LTS
-  构建号      24.04
+  构建号      5fdd0af
   内核        Linux 5.15.167.4-microsoft-standard-WSL2
   架构        x86_64 / linux
   主机名      DESKTOP-XXXX
   配置目录    /home/me/.pi/agent
   虚拟机      WSL2（Windows 构建 10.0.22631.4317）
-  浏览器      宿主机 Chrome  /mnt/c/Program Files/Google/Chrome/Application/chrome.exe
-
-  检测到 WSL：可指定用「容器内」还是「宿主机」的浏览器
-  * [1] 宿主机 Chrome    /mnt/c/Program Files/Google/Chrome/Application/chrome.exe
-    [2] 容器内 系统默认   /usr/bin/xdg-open
-  输入 /browser <序号> 选定；/browser auto 交回自动
 ```
 
-`虚拟机` 一行**只在识别到 WSL 时出现**，其他系统不输出。
-WSL 下容器和宿主机是两套环境，容器里往往根本没装浏览器，所以列出来让你选：
-`/browser 2` 选定、`/browser auto` 交回自动。Windows / macOS / 原生 Linux 直接自动识别
-（Windows 查 `Program Files`，macOS 查 `/Applications`，Linux 扫 `PATH`）。
+`构建号` 是**编译这份二进制时源码所在的 git 提交**（`build.rs` 在编译期注入，
+工作区有改动会标 `-dirty`）—— 报 bug 时对得上号。
 
-`/open [url]` 用选定的浏览器打开网页，默认 `chat.deepseek.com` —— 取 userToken 时省得手敲。
+`虚拟机` 一行**只在识别到 WSL 时出现**，其他系统不输出。
 
 `!<命令>` 直接跑 shell，输出只打印、**不进对话上下文**（不消耗 token）：
 

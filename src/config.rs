@@ -167,9 +167,13 @@ pub struct AppConfig {
     pub max_tool_steps: usize,
     #[serde(rename = "contextMode")]
     pub context_mode: ContextMode,
-    /// 用哪个浏览器打开网页（/info、/open 会用到）。
-    /// 空 = 自动；其余是探测出来的 id（如 `host:chrome`）或 1 起的序号。
+    /// 用哪个浏览器打开登录页（`/login browser`）。
+    /// 空 = 自动探测；也可以填 sysinfo 探测出的 id。
     pub browser: String,
+    /// 设备标识：密码登录要带上它，服务端据此认得这台机器。
+    /// 空 = 还没生成，第一登录时随机生成并落盘。
+    #[serde(rename = "deviceId")]
+    pub device_id: String,
 }
 
 /// 默认 PoW WASM 地址（上游更新静态资源后需替换）
@@ -197,6 +201,7 @@ impl Default for AppConfig {
             max_tool_steps: 25,
             context_mode: ContextMode::Reuse,
             browser: String::new(),
+            device_id: String::new(),
         }
     }
 }

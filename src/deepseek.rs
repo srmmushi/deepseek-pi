@@ -18,9 +18,35 @@ use crate::stream::{is_retryable, SseParser, StreamEvent};
 /// DeepSeek 站点源
 pub const ORIGIN: &str = "https://chat.deepseek.com";
 
+/// 账号密码登录（手机号 / 邮箱）。已由多个第三方项目佐证存在，
+/// 但请求体字段名仍以实际响应为准（失败时会把原始响应打出来）。
+const EP_LOGIN: &str = "/users/login";
+/// 微信扫码：取二维码。
+///
+/// **未能离线核实** —— DeepSeek 没有公开文档，第三方项目里也没搜到这个路径。
+/// 这里按同类接口的形状推测，字段名做了多重兜底；真跑不通时
+/// `/login wechatqr` 会把服务端原始响应打出来，照着改一行即可。
+const EP_WECHAT_QR: &str = "/users/create_wechat_qrcode";
 const EP_SESSION_CREATE: &str = "/chat_session/create";
 const EP_SESSION_DELETE: &str = "/chat_session/delete";
 const EP_SESSION_PAGE: &str = "/chat_session/fetch_page";
+
+/// 从登录响应里挖出 userToken。嵌套层级没核实过，几种常见位置都试一遍。
+fn dig_token(data: &Value) -> Option<String> {
+    const KEYS: [&str; 2] = ["token", "user_token"];
+    let pick = |v: &Value| -> Option<String> {
+        KEYS.iter()
+            .find_map(|k| v.get(*k).and_then(|x| x.as_str()))
+            .map(|s| s.to_string())
+    };
+    pick(data)
+        .or_else(|| data.get("user").and_then(|u| pick(u)))
+        .or_else(|| {
+            data.get("data")
+                .and_then(|d| d.get("user"))
+                .and_then(|u| pick(u))
+        })
+}
 const EP_POW_CHALLENGE: &str = "/chat/create_pow_challenge";
 const EP_COMPLETION: &str = "/chat/completion";
 const EP_STOP_STREAM: &str = "/chat/stop_stream";
@@ -419,8 +445,12 @@ impl DeepSeekClient {
         if has_body {
             put("Content-Type", "application/json");
         }
+        // 空 token 视为匿名：登录请求本身就没有凭证，
+        // 带上 "Bearer " 反而可能被风控挡下来
         if let Some(t) = token {
-            put("Authorization", &format!("Bearer {t}"));
+            if !t.is_empty() {
+                put("Authorization", &format!("Bearer {t}"));
+            }
         }
         if let Some(p) = pow {
             put("x-ds-pow-response", p);
@@ -501,6 +531,69 @@ impl DeepSeekClient {
             });
         }
         Ok(data.get("biz_data").cloned().unwrap_or(Value::Null))
+    }
+
+    /// 手机号 / 邮箱 + 密码登录，成功返回 userToken。
+    ///
+    /// 手机号会走 `mobile` + `area_code`，其余一律当邮箱走 `email`。
+    pub fn login_with_password(
+        &self,
+        account: &str,
+        password: &str,
+        device_id: &str,
+    ) -> Result<String, DsError> {
+        let account = account.trim();
+        let mut body = json!({
+            "password": password,
+            "device_id": device_id,
+            "os": "web",
+        });
+
+        let digits: String = account.chars().filter(|c| c.is_ascii_digit()).collect();
+        let only_digits = account
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '+' || c == '-' || c == ' ');
+        if only_digits && digits.len() >= 6 {
+            let (area, mobile) = if digits.len() > 11 {
+                // 写成 +8613800138000 时，前面的就是国家码
+                (format!("+{}", &digits[..digits.len() - 11]), digits[digits.len() - 11..].to_string())
+            } else {
+                ("+86".to_string(), digits.clone())
+            };
+            body["mobile"] = json!(mobile);
+            body["area_code"] = json!(area);
+        } else {
+            body["email"] = json!(account);
+        }
+
+        let data = self.post_json(EP_LOGIN, "", &body)?;
+        dig_token(&data).ok_or_else(|| DsError::Api {
+            code: -1,
+            message: format!("登录响应里没有 token，原始内容：{data}"),
+        })
+    }
+
+    /// 取微信登录二维码，返回 (二维码内容, 轮询用 id)。
+    pub fn wechat_qrcode(&self, device_id: &str) -> Result<(String, String), DsError> {
+        let data = self.post_json(
+            EP_WECHAT_QR,
+            "",
+            &json!({ "device_id": device_id, "os": "web" }),
+        )?;
+        let url = ["qrcode_url", "qr_code_url", "qr_url", "url", "qrcode"]
+            .iter()
+            .find_map(|k| data.get(*k).and_then(|v| v.as_str()))
+            .map(|s| s.to_string())
+            .ok_or_else(|| DsError::Api {
+                code: -1,
+                message: format!("响应里没有二维码地址，原始内容：{data}"),
+            })?;
+        let id = ["qrcode_id", "qr_code_id", "ticket", "id"]
+            .iter()
+            .find_map(|k| data.get(*k).and_then(|v| v.as_str()))
+            .unwrap_or_default()
+            .to_string();
+        Ok((url, id))
     }
 
     /// 创建会话

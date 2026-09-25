@@ -115,8 +115,10 @@ pub struct App {
     think_chars: usize,
     pub last_thinking: String,
 
-    /// 登录输入模式：下一次提交当作 token，不发给模型、也不进会话记录
+    /// 登录输入模式：下一次提交当作凭证，不发给模型、也不进会话记录
     login_mode: bool,
+    /// 输入内容是否掩码显示（token / 密码）
+    login_mask: bool,
     login_input: Option<String>,
 
     /// Ctrl+T / Ctrl+S 的切换请求，交给主循环去改 core.config
@@ -150,6 +152,7 @@ impl Default for App {
             think_chars: 0,
             last_thinking: String::new(),
             login_mode: false,
+            login_mask: false,
             login_input: None,
             toggle_request: None,
             anchors: Vec::new(),
@@ -339,15 +342,18 @@ impl App {
         self.selection.is_some()
     }
 
-    /// /login：切到 token 输入模式（提示符随之改变）
-    pub fn start_login(&mut self) {
+    /// /login：切到凭证输入模式（提示符随之改变）。`mask` 为真时掩码显示。
+    pub fn start_login(&mut self, mask: bool) {
         self.login_mode = true;
+        self.login_mask = mask;
         self.input.clear();
         self.cursor = 0;
     }
 
     fn cancel_login(&mut self) {
         self.login_mode = false;
+        self.login_mask = false;
+        self.login_input = None;
         self.input.clear();
         self.cursor = 0;
         self.line_styled("已取消登录。", dim());
@@ -683,10 +689,16 @@ impl App {
         } else {
             ("❯ ", Style::default().fg(Color::Cyan))
         };
+        // token / 密码掩码显示，屏幕上看不到原文
+        let shown = if self.login_mask {
+            "*".repeat(self.input.chars().count())
+        } else {
+            self.input.clone()
+        };
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(prompt, prompt_style.add_modifier(Modifier::BOLD)),
-                Span::raw(self.input.clone()),
+                Span::raw(shown),
             ])),
             input_area,
         );

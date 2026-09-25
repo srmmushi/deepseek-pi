@@ -54,21 +54,45 @@ DSP (deepseek-pi) —— 终端编程助手，仅使用 DeepSeek 网页版
 
 命令
   /help /login /logout /thinking /search /thinking-view /model /lang
-  /status /sessions /session /clear /goto /info /browser /open /quit
+  /status /sessions /session /clear /goto /info /open /quit
 
 环境
-  /info              系统、架构、构建号、浏览器；WSL 下会同时列出容器内与宿主机的浏览器
-  /browser [n|auto]  选择用哪个浏览器，n 是 /info 里列出的序号
-  /open [url]        用选定的浏览器打开网页（默认 chat.deepseek.com）
+  /info              系统、架构、构建号（当前那次 git 提交）、主机名；WSL 才显示虚拟机
+  /open [url]        用自动识别的浏览器打开网页（默认 chat.deepseek.com）
   Ctrl+T / Ctrl+S    切换深度思考 / 智能搜索（状态栏显示当前值，不打断输出）
 
 登录
-  Rust 版不做浏览器自动化。三种方式任选：
-    /login <userToken>     直接带上 token
-    /login                 在界面里粘贴 token（回车确认，Esc 取消）
-    DSP_TOKEN=<token> dsp  从环境变量注入
-  token 取自 chat.deepseek.com 的 LocalStorage（key 为 userToken）。
-  加密格式与历史版本一致，磁盘上已有的凭证可以直接复用。";
+  /login                打开登录页（等同 /login browser）
+  /login token          手动粘贴 userToken
+  /login passwd         手机号 / 邮箱 + 密码
+  /login wechatqr       微信扫码，二维码直接画在终端里
+  DSP_TOKEN=<token> dsp 环境变量，/login 时优先采用
+  userToken 取法：登录 chat.deepseek.com 后按 F12，
+  控制台执行 localStorage.getItem('userToken')。
+  加密格式未变，磁盘上已有的凭证可以直接复用。";
+
+/// 登录页地址（DeepSeek 网页端登录页）
+const SIGN_IN_URL: &str = "https://chat.deepseek.com/sign_in";
+
+/// 交互式登录的阶段。`App` 只会「要一次输入」，多步流程靠这个阶段机串起来。
+const STAGE_NONE: u8 = 0;
+/// 等粘贴 userToken
+const STAGE_TOKEN: u8 = 1;
+/// 等手机号 / 邮箱（密码登录第一步）
+const STAGE_ACCOUNT: u8 = 2;
+/// 等密码（密码登录第二步）
+const STAGE_PASSWORD: u8 = 3;
+
+const LOGIN_HELP: &str = "\
+登录方式（/login 后接子命令）
+  /login            打开登录页，登录后取 userToken 粘回来
+  /login browser    同上（默认）
+  /login token      手动粘贴 userToken
+  /login passwd     手机号 / 邮箱 + 密码
+  /login wechatqr   微信扫码（二维码直接画在终端里）
+
+userToken 的取法：在浏览器里登录 chat.deepseek.com，
+按 F12 打开控制台执行 localStorage.getItem('userToken')，把结果粘进来。";
 
 #[derive(Default)]
 struct Args {
@@ -121,7 +145,7 @@ fn main() {
         // 与 /info 同一份内容，但不需要进 TUI —— 也方便贴到 bug 报告里
         let config = config::load_config(&paths);
         let dir = paths.config_dir.display().to_string();
-        for line in sysinfo::report(&dir, &config.browser, config.language) {
+        for line in sysinfo::report(&dir, config.language) {
             println!("{line}");
         }
         return;
@@ -172,6 +196,10 @@ struct Core {
     aborted: Arc<Mutex<bool>>,
     /// /system-prompt edit：交给事件循环临时让出终端
     pending_editor: bool,
+    /// 交互式登录的当前阶段（见 STAGE_*）
+    login_stage: u8,
+    /// 密码登录第一步填的账号
+    login_account: String,
 }
 
 impl Core {
@@ -204,6 +232,22 @@ impl Core {
 
     fn persist(&mut self) {
         let _ = config::save_config(&self.paths, &self.config);
+    }
+
+    /// 设备标识：密码登录要带上它。没有就随机生成一个并落盘，
+    /// 保证同一台机器每次登录用的是同一个 id。
+    fn device_id(&mut self) -> String {
+        if self.config.device_id.is_empty() {
+            use rand::Rng;
+            let mut rng = rand::thread_rng();
+            let mut id = String::with_capacity(32);
+            for _ in 0..16 {
+                id.push_str(&format!("{:02x}", rng.gen::<u8>()));
+            }
+            self.config.device_id = id;
+            self.persist();
+        }
+        self.config.device_id.clone()
     }
 
     fn status_text(&self) -> String {
@@ -255,6 +299,8 @@ fn run(paths: ConfigPaths, resume: bool) -> anyhow::Result<()> {
         aborted: Arc::new(Mutex::new(false)),
         pending_editor: false,
         paths,
+        login_stage: STAGE_NONE,
+        login_account: String::new(),
     };
 
     let mut app = App::default();
@@ -343,8 +389,26 @@ fn event_loop(
             app.notice_copied(len);
         }
 
-        if let Some(token) = app.take_login_input() {
-            do_login(core, app, &token);
+        // 交互式登录：App 只负责「要一次输入」，多步流程靠 login_stage 串起来
+        if let Some(text) = app.take_login_input() {
+            match core.login_stage {
+                STAGE_TOKEN => {
+                    core.login_stage = STAGE_NONE;
+                    do_login(core, app, &text);
+                }
+                STAGE_ACCOUNT => {
+                    core.login_account = text;
+                    core.login_stage = STAGE_PASSWORD;
+                    app.start_login(true);
+                    app.line_styled("请输入密码，回车登录（Esc 取消）", ui::dim());
+                }
+                STAGE_PASSWORD => {
+                    core.login_stage = STAGE_NONE;
+                    let account = core.login_account.clone();
+                    do_password_login(core, app, &account, &text);
+                }
+                _ => {}
+            }
         }
 
         // Ctrl+T / Ctrl+S 的开关请求（界面层拿不到 core.config，只能这样回传）
@@ -521,71 +585,8 @@ fn command(input: &str, core: &mut Core, app: &mut App) {
         }
         "/info" => {
             let dir = core.paths.config_dir.display().to_string();
-            let browser = core.config.browser.clone();
-            for line in sysinfo::report(&dir, &browser, lang) {
+            for line in sysinfo::report(&dir, lang) {
                 app.line(line);
-            }
-        }
-        "/browser" => {
-            let list = sysinfo::detect_browsers();
-            let in_wsl = sysinfo::wsl_version().is_some();
-            if list.is_empty() {
-                app.line_styled(
-                    if lang == Lang::Zh {
-                        "没有检测到可用浏览器。"
-                    } else {
-                        "No browser found."
-                    },
-                    ui::warn(),
-                );
-            } else if arg.is_empty() {
-                let current = sysinfo::resolve(&list, &core.config.browser).unwrap_or(0);
-                for (n, b) in list.iter().enumerate() {
-                    let mark = if n == current { "*" } else { " " };
-                    app.line(format!(
-                        "{mark} [{}] {}",
-                        n + 1,
-                        sysinfo::describe(b, in_wsl, lang)
-                    ));
-                }
-                app.line_styled(
-                    if lang == Lang::Zh {
-                        "用 /browser <序号> 选定；/browser auto 交回自动"
-                    } else {
-                        "use /browser <n> to pick; /browser auto to reset"
-                    },
-                    ui::dim(),
-                );
-            } else if arg.eq_ignore_ascii_case("auto") {
-                core.config.browser.clear();
-                core.persist();
-                let idx = sysinfo::resolve(&list, "").unwrap_or(0);
-                app.line_styled(
-                    format!(
-                        "浏览器：自动 → {}",
-                        sysinfo::describe(&list[idx], in_wsl, lang)
-                    ),
-                    ui::ok(),
-                );
-            } else {
-                match sysinfo::resolve(&list, &arg) {
-                    Some(i) => {
-                        core.config.browser = list[i].id.clone();
-                        core.persist();
-                        app.line_styled(
-                            format!("浏览器已切换为 {}", sysinfo::describe(&list[i], in_wsl, lang)),
-                            ui::ok(),
-                        );
-                    }
-                    None => app.line_styled(
-                        if lang == Lang::Zh {
-                            "序号无效，先输入 /browser 看列表。"
-                        } else {
-                            "Invalid index; run /browser to list them."
-                        },
-                        ui::warn(),
-                    ),
-                }
             }
         }
         "/open" => {
@@ -744,19 +745,29 @@ fn command(input: &str, core: &mut Core, app: &mut App) {
                 }
             }
         },
-        // 三条登录路径，按优先级：/login <token> > 环境变量 > 交互粘贴
+        // /login 后接子命令：browser（默认）/ token / passwd / wechatqr
         "/login" => {
-            if !arg.is_empty() {
-                do_login(core, app, &arg);
-            } else if let Ok(token) = std::env::var("DSP_TOKEN") {
-                if token.trim().is_empty() {
-                    app.start_login();
-                } else {
-                    let token = token.trim().to_string();
-                    do_login(core, app, &token);
+            let what = if arg.is_empty() { "browser" } else { arg.as_str() };
+            match what {
+                "browser" | "web" => open_login_page(core, app),
+                "token" | "paste" => {
+                    core.login_stage = STAGE_TOKEN;
+                    app.start_login(true);
+                    app.line_styled("粘贴 userToken 后回车（Esc 取消）", ui::dim());
                 }
-            } else {
-                app.start_login();
+                "passwd" | "password" => {
+                    core.login_stage = STAGE_ACCOUNT;
+                    app.start_login(false);
+                    app.line_styled("输入手机号或邮箱，回车继续（Esc 取消）", ui::dim());
+                }
+                "wechatqr" | "wechat" | "qr" => login_with_wechat_qr(core, app),
+                // 兼容旧写法 /login <userToken>
+                other if other.len() >= 16 && !other.contains(' ') => do_login(core, app, other),
+                _ => {
+                    for line in LOGIN_HELP.lines() {
+                        app.line(line);
+                    }
+                }
             }
         }
         "/logout" => {
@@ -770,6 +781,101 @@ fn command(input: &str, core: &mut Core, app: &mut App) {
         }
         other => app.line_styled(format!("未知命令 {other}（/help 查看全部）"), ui::warn()),
     }
+}
+
+/// /login browser：打开 DeepSeek 登录页，登录后把 userToken 取回来。
+/// 环境里已经给了 DSP_TOKEN 就直接用，不折腾浏览器。
+fn open_login_page(core: &mut Core, app: &mut App) {
+    if let Ok(token) = std::env::var("DSP_TOKEN") {
+        if !token.trim().is_empty() {
+            let token = token.trim().to_string();
+            do_login(core, app, &token);
+            return;
+        }
+    }
+    let list = sysinfo::detect_browsers();
+    let in_wsl = sysinfo::wsl_version().is_some();
+    match sysinfo::resolve(&list, &core.config.browser) {
+        Some(i) => {
+            let shown = sysinfo::describe(&list[i], in_wsl, core.lang);
+            match sysinfo::open_url(&list[i], SIGN_IN_URL) {
+                Ok(()) => {
+                    app.line_styled(format!("已用 {shown} 打开 {SIGN_IN_URL}"), ui::ok());
+                    app.line_styled(
+                        "登录后在该页按 F12，控制台执行 localStorage.getItem('userToken')，\
+                         再用 /login token 把结果粘进来。",
+                        ui::dim(),
+                    );
+                }
+                Err(e) => app.line_styled(format!("打开浏览器失败：{e}"), ui::err()),
+            }
+        }
+        None => app.line_styled(
+            format!("没检测到浏览器，手动打开 {SIGN_IN_URL} 吧。"),
+            ui::warn(),
+        ),
+    }
+}
+
+/// 密码登录第二步：拿账号 + 密码去换 token
+fn do_password_login(core: &mut Core, app: &mut App, account: &str, password: &str) {
+    let client = match core.client() {
+        Ok(c) => c,
+        Err(e) => {
+            app.line_styled(format!("! {e}"), ui::err());
+            return;
+        }
+    };
+    let device_id = core.device_id();
+    app.line_styled("正在登录…", ui::dim());
+    match client.login_with_password(account, password, &device_id) {
+        Ok(token) => do_login(core, app, &token),
+        Err(e) => {
+            app.line_styled(format!("登录失败：{e}"), ui::err());
+            app.line_styled("若提示字段不符，把上面这段原文发我就能改对。", ui::dim());
+        }
+    }
+}
+
+/// 微信扫码登录：把二维码画在终端里
+fn login_with_wechat_qr(core: &mut Core, app: &mut App) {
+    let client = match core.client() {
+        Ok(c) => c,
+        Err(e) => {
+            app.line_styled(format!("! {e}"), ui::err());
+            return;
+        }
+    };
+    let device_id = core.device_id();
+    match client.wechat_qrcode(&device_id) {
+        Ok((content, _id)) => {
+            app.line("");
+            match render_qr(&content) {
+                Ok(art) => {
+                    for line in art {
+                        app.line(line);
+                    }
+                }
+                Err(e) => app.line_styled(format!("二维码渲染失败：{e}"), ui::err()),
+            }
+            app.line("");
+            app.line_styled("用微信扫码并在手机上确认。", ui::ok());
+        }
+        Err(e) => {
+            app.line_styled(format!("获取二维码失败：{e}"), ui::err());
+            app.line_styled(
+                "这个接口路径我没能离线核实，把上面原文发我即可修正。",
+                ui::dim(),
+            );
+        }
+    }
+}
+
+/// 把二维码画成终端字符画（Dense1x2：一个字符高塞两行，手机扫得动）
+fn render_qr(content: &str) -> Result<Vec<String>, String> {
+    let code = qrcode::QrCode::new(content.as_bytes()).map_err(|e| e.to_string())?;
+    let art = code.render::<qrcode::render::unicode::Dense1x2>().build();
+    Ok(art.lines().map(|l| l.to_string()).collect())
 }
 
 /// 保存一份 token。本程序不做浏览器自动化，token 由用户提供

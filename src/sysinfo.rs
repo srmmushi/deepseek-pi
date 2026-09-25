@@ -15,8 +15,8 @@ use crate::config::Lang;
 pub struct EnvInfo {
     pub app_version: String,
     pub os_name: String,
-    /// 系统构建号：Windows/WSL 取 Windows 版本号，Linux 取 os-release 的 BUILD_ID/VERSION_ID
-    pub build: String,
+    /// 构建号：编译时那份源码在 GitHub 上的提交短哈希（build.rs 注入）
+    pub commit: String,
     /// 内核（`uname -sr`）
     pub kernel: String,
     pub arch: String,
@@ -76,7 +76,7 @@ pub fn collect() -> EnvInfo {
             if cfg!(debug_assertions) { "debug" } else { "release" }
         ),
         os_name: os_name(),
-        build: os_build(),
+        commit: env!("DSP_GIT_HASH").to_string(),
         kernel: kernel(),
         arch: format!("{} / {}", std::env::consts::ARCH, std::env::consts::OS),
         host: hostname::get()
@@ -110,24 +110,6 @@ fn os_name() -> String {
         }
     }
     std::env::consts::OS.to_string()
-}
-
-fn os_build() -> String {
-    // 只有原生 Windows 才把「系统构建号」当成 Windows 版本号；
-    // WSL 下 操作系统 与 构建号 都应该描述发行版，Windows 版本号归到「虚拟机」那行
-    if cfg!(target_os = "windows") {
-        if let Some(b) = ver_build() {
-            return b;
-        }
-    }
-    if let Ok(text) = std::fs::read_to_string("/etc/os-release") {
-        if let Some(v) =
-            os_release_field(&text, "BUILD_ID").or_else(|| os_release_field(&text, "VERSION_ID"))
-        {
-            return v;
-        }
-    }
-    String::new()
 }
 
 fn kernel() -> String {
@@ -297,30 +279,25 @@ fn program_files(x86: bool) -> Option<PathBuf> {
 // ── /info 输出 ───────────────────────────────────────────────
 
 /// 生成 `/info` 的多行输出（已排版好）
-pub fn report(config_dir: &str, chosen: &str, lang: Lang) -> Vec<String> {
+pub fn report(config_dir: &str, lang: Lang) -> Vec<String> {
     let zh = lang == Lang::Zh;
     let info = collect();
-    let list = detect_browsers();
-    let in_wsl = info.wsl.is_some();
 
     let mut out = vec![String::new()];
     out.push((if zh { "环境信息" } else { "Environment" }).to_string());
 
     let l_app = if zh { "程序版本" } else { "Version" };
     let l_os = if zh { "操作系统" } else { "OS" };
-    let l_build = if zh { "构建号" } else { "Build" };
+    let l_build = if zh { "构建号" } else { "Commit" };
     let l_kernel = if zh { "内核" } else { "Kernel" };
     let l_arch = if zh { "架构" } else { "Arch" };
     let l_host = if zh { "主机名" } else { "Host" };
     let l_vm = if zh { "虚拟机" } else { "VM" };
     let l_dir = if zh { "配置目录" } else { "Config dir" };
-    let l_browser = if zh { "浏览器" } else { "Browser" };
 
     out.push(format!("  {}{}", pad(l_app, 12), info.app_version));
+    out.push(format!("  {}{}", pad(l_build, 12), info.commit));
     out.push(format!("  {}{}", pad(l_os, 12), info.os_name));
-    if !info.build.is_empty() {
-        out.push(format!("  {}{}", pad(l_build, 12), info.build));
-    }
     if !info.kernel.is_empty() {
         out.push(format!("  {}{}", pad(l_kernel, 12), info.kernel));
     }
@@ -338,52 +315,6 @@ pub fn report(config_dir: &str, chosen: &str, lang: Lang) -> Vec<String> {
         out.push(format!("  {}{vm}{extra}", pad(l_vm, 12)));
     }
 
-    // 浏览器
-    if list.is_empty() {
-        out.push(format!(
-            "  {}{}",
-            pad(l_browser, 12),
-            if zh { "未检测到可用浏览器" } else { "no browser found" }
-        ));
-        return out;
-    }
-    let idx = resolve(&list, chosen).unwrap_or_else(|| prefer_auto(&list).unwrap_or(0));
-    let auto = chosen.trim().is_empty() || chosen.trim() == "auto";
-    let mark = if auto {
-        if zh { "（自动）" } else { " (auto)" }
-    } else {
-        ""
-    };
-    out.push(format!(
-        "  {}{}{mark}",
-        pad(l_browser, 12),
-        describe(&list[idx], in_wsl, lang)
-    ));
-
-    // WSL 下容器/宿主机差异很大，列出来让用户选
-    if in_wsl && list.len() > 1 {
-        out.push(String::new());
-        out.push(
-            (if zh {
-                "  检测到 WSL：可指定用「容器内」还是「宿主机」的浏览器"
-            } else {
-                "  WSL detected: pick a container or host browser"
-            })
-            .to_string(),
-        );
-        for (n, b) in list.iter().enumerate() {
-            let cur = if n == idx { "*" } else { " " };
-            out.push(format!("  {cur} [{}] {}", n + 1, describe(b, in_wsl, lang)));
-        }
-        out.push(format!(
-            "  {}",
-            if zh {
-                "输入 /browser <序号> 选定；/browser auto 交回自动"
-            } else {
-                "use /browser <n> to pick; /browser auto to reset"
-            }
-        ));
-    }
     out
 }
 

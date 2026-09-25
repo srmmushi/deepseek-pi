@@ -31,6 +31,8 @@ rand = "0.8"
 base64 = "0.22"
 # PoW：执行 DeepSeek 官方 sha3 wasm
 wasmi = { version = "0.36", default-features = false, features = ["std"] }
+# 微信扫码登录：把二维码画到终端里（只用它的 unicode 渲染，不拉 image/svg）
+qrcode = { version = "0.14", default-features = false }
 # 环境信息（指纹派生）
 hostname = "0.4"
 whoami = "1"
