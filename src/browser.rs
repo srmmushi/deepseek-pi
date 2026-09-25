@@ -21,13 +21,7 @@ const MAX_DEPTH: usize = 6;
 pub struct Hit {
     pub browser: String,
     pub dir: PathBuf,
-    /// 文件里出现 userToken 的次数
-    pub key_hits: usize,
-    /// 文件里是否出现本站域名
-    pub origin: bool,
     pub token: Option<String>,
-    /// 命中点之后 120 字节的可打印原文（最多 3 条），取不到凭证时用它定位
-    pub traces: Vec<String>,
 }
 
 /// 扫遍所有候选目录
@@ -37,30 +31,15 @@ pub fn scan() -> Vec<Hit> {
         let mut hit = Hit {
             browser,
             dir: dir.clone(),
-            key_hits: 0,
-            origin: false,
             token: None,
-            traces: Vec::new(),
         };
         // 先写入日志（新记录都在这儿、且不压缩），再落盘的表文件
         let mut files = files_by_ext(&dir, "log");
         files.extend(files_by_ext(&dir, "ldb"));
         for file in files {
             let Ok(bytes) = read_capped(&file) else { continue };
-            hit.key_hits += count_of(&bytes, KEY);
-            hit.origin |= find(&bytes, ORIGIN).is_some();
             if hit.token.is_none() {
                 hit.token = token_in(&bytes);
-            }
-            if hit.traces.len() < 3 {
-                let mut from = 0;
-                while hit.traces.len() < 3 {
-                    let Some(at) = find(&bytes[from..], KEY) else {
-                        break;
-                    };
-                    hit.traces.push(trace_after(&bytes, from + at));
-                    from += at + KEY.len();
-                }
             }
         }
         out.push(hit);
@@ -277,17 +256,6 @@ fn token_in(bytes: &[u8]) -> Option<String> {
     None
 }
 
-/// 命中点之后 120 字节的可打印原文（非可打印字符显示成 '.'）。
-/// 只在 --grab 里打出来用 —— 取不到凭证时，看一眼就知道值的布局长什么样。
-fn trace_after(bytes: &[u8], at: usize) -> String {
-    let start = (at + KEY.len()).min(bytes.len());
-    let end = (start + 120).min(bytes.len());
-    bytes[start..end]
-        .iter()
-        .map(|b| if (0x20..0x7f).contains(b) { *b as char } else { '.' })
-        .collect()
-}
-
 /// 键名之后的字节里取 token。
 ///
 /// 键和值之间隔多少字节是不固定的，不能写死：
@@ -352,16 +320,6 @@ fn json_value(text: &str) -> Option<String> {
 
 fn is_token_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '=')
-}
-
-fn count_of(haystack: &[u8], needle: &[u8]) -> usize {
-    let mut count = 0;
-    let mut from = 0;
-    while let Some(at) = find(&haystack[from..], needle) {
-        count += 1;
-        from += at + needle.len();
-    }
-    count
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {

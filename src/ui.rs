@@ -138,7 +138,6 @@ pub struct App {
     spinner: usize,
     /// 本次思考已收到的字数，只用于状态栏
     think_chars: usize,
-    pub last_thinking: String,
 
     /// 登录输入模式：下一次提交当作凭证，不发给模型、也不进会话记录
     login_mode: bool,
@@ -175,7 +174,6 @@ impl Default for App {
             think_since: None,
             spinner: 0,
             think_chars: 0,
-            last_thinking: String::new(),
             login_mode: false,
             login_mask: false,
             login_input: None,
@@ -293,7 +291,6 @@ impl App {
                     .filter(|l| !l.trim().is_empty())
                     .map(|l| format!("    {l}"))
                     .collect();
-                self.last_thinking = text;
                 self.block(head, dim(), body, true);
             }
             UiEvent::ToolBatchStart(calls) => {
@@ -371,7 +368,6 @@ impl App {
         self.origin = None;
         self.dragging = false;
         self.offset = 0;
-        self.last_thinking.clear();
     }
 
     pub fn set_busy(&mut self, value: bool) {
@@ -675,15 +671,6 @@ impl App {
         }
     }
 
-    pub fn push_thinking(&mut self, text: &str) {
-        if text.trim().is_empty() {
-            self.line_styled("没有可展开的思考内容。", dim());
-            return;
-        }
-        for line in text.lines().filter(|l| !l.trim().is_empty()) {
-            self.line_styled(format!("    {line}"), dim());
-        }
-    }
 
     fn reflow(&mut self, width: usize) {
         let width = width.max(24);

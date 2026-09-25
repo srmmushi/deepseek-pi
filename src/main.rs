@@ -196,19 +196,15 @@ fn grab(paths: &ConfigPaths) -> i32 {
 
     let mut found: Option<(String, String)> = None;
     for hit in &hits {
-        println!("{}  {}", hit.browser, hit.dir.display());
         println!(
-            "  userToken {} 次 · 域名 {} · {}",
-            hit.key_hits,
-            if hit.origin { "在" } else { "不在" },
+            "{}  {}  {}",
+            hit.browser,
+            hit.dir.display(),
             match &hit.token {
                 Some(t) => format!("凭证 {} 字符", t.chars().count()),
                 None => "未取到凭证".to_string(),
             }
         );
-        for trace in &hit.traces {
-            println!("  键后字节  {trace}");
-        }
         if found.is_none() {
             found = hit.token.as_ref().map(|t| (hit.browser.clone(), t.clone()));
         }
@@ -746,18 +742,6 @@ fn command(
             core.config.search = toggle(&arg).unwrap_or(!core.config.search);
             after_toggle(core, app, "toggle.search", core.config.search, false);
         }
-        // /thinking-view 已取消，用户路径改走 Ctrl+O。
-        // 这条留作内部实现，免得 show_thinking / push_thinking 变成死代码。
-        "/__thinking-view" => {
-            core.config.show_thinking = toggle(&arg).unwrap_or(!core.config.show_thinking);
-            core.persist();
-            let state = on_off(lang, core.config.show_thinking);
-            app.line_styled(format!("思考显示 {state}"), ui::dim());
-            if core.config.show_thinking {
-                let text = app.last_thinking.clone();
-                app.push_thinking(&text);
-            }
-        }
         "/model" => {
             if arg.is_empty() {
                 let all: Vec<&str> = config::MODELS.iter().map(|(id, _, _)| *id).collect();
@@ -878,6 +862,11 @@ fn command(
         },
         // /login 后接子命令：browser（默认）/ token / passwd / wechatqr
         "/login" => {
+            // 已经登录就别再走一遍，免得把手头的凭证覆盖掉
+            if core.token.is_some() {
+                app.line_styled("已登录。要换账号请先 /logout 退出登录。", ui::warn());
+                return;
+            }
             let what = if arg.is_empty() { "browser" } else { arg.as_str() };
             match what {
                 "browser" | "web" => open_login_page(core, app, rx),

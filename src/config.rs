@@ -145,8 +145,6 @@ pub struct AppConfig {
     pub language: Lang,
     pub thinking: bool,
     pub search: bool,
-    /// 是否展开思考正文（false = 折叠为一行摘要）
-    pub show_thinking: bool,
     pub model: String,
     #[serde(rename = "userAgent")]
     pub user_agent: String,
@@ -188,7 +186,6 @@ impl Default for AppConfig {
             language: Lang::detect(),
             thinking: false,
             search: true,
-            show_thinking: false,
             model: "deepseek-chat".to_string(),
             user_agent: DEFAULT_UA.to_string(),
             wasm_url: DEFAULT_WASM_URL.to_string(),
