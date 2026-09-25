@@ -21,15 +21,32 @@ pub const ORIGIN: &str = "https://chat.deepseek.com";
 /// 账号密码登录（手机号 / 邮箱）。已由多个第三方项目佐证存在，
 /// 但请求体字段名仍以实际响应为准（失败时会把原始响应打出来）。
 const EP_LOGIN: &str = "/users/login";
-/// 微信扫码：取二维码。
+/// 微信扫码登录页（二维码编号就从它的 HTML 里抠）
+const SIGN_IN_URL: &str = "https://chat.deepseek.com/sign_in";
+/// 拿微信的 code 换 DeepSeek 的 userToken。
 ///
-/// **未能离线核实** —— DeepSeek 没有公开文档，第三方项目里也没搜到这个路径。
-/// 这里按同类接口的形状推测，字段名做了多重兜底；真跑不通时
-/// `/login wechatqr` 会把服务端原始响应打出来，照着改一行即可。
-const EP_WECHAT_QR: &str = "/users/create_wechat_qrcode";
+/// **未能离线核实** —— 扫码链路（取编号 / 取图片 / 轮询 errcode）都是实测可用的，
+/// 只有最后这步换 token 的路径查不到。跑不通时会把服务端原始响应打出来。
+const EP_WECHAT_LOGIN: &str = "/users/login_by_wechat";
 const EP_SESSION_CREATE: &str = "/chat_session/create";
 const EP_SESSION_DELETE: &str = "/chat_session/delete";
 const EP_SESSION_PAGE: &str = "/chat_session/fetch_page";
+
+/// 取 `key` 之后的那一串「像编号的字符」（字母数字以及 - _）。
+/// 用来从 HTML 的 `src="/connect/qrcode/XXX"` 或微信的
+/// `window.wx_errcode=405;window.wx_code='YYY';` 里抠值，不引入正则。
+fn after_key(text: &str, key: &str) -> Option<String> {
+    let at = text.find(key)? + key.len();
+    let value: String = text[at..]
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
 
 /// 从登录响应里挖出 userToken。嵌套层级没核实过，几种常见位置都试一遍。
 fn dig_token(data: &Value) -> Option<String> {
@@ -573,27 +590,79 @@ impl DeepSeekClient {
         })
     }
 
-    /// 取微信登录二维码，返回 (二维码内容, 轮询用 id)。
-    pub fn wechat_qrcode(&self, device_id: &str) -> Result<(String, String), DsError> {
-        let data = self.post_json(
-            EP_WECHAT_QR,
-            "",
-            &json!({ "device_id": device_id, "os": "web" }),
-        )?;
-        let url = ["qrcode_url", "qr_code_url", "qr_url", "url", "qrcode"]
-            .iter()
-            .find_map(|k| data.get(*k).and_then(|v| v.as_str()))
-            .map(|s| s.to_string())
-            .ok_or_else(|| DsError::Api {
+    /// 从登录页里抠出微信二维码的编号。
+    ///
+    /// 页面里有一张 `<img class="js_qrcode img web_qrcode_img" src="/connect/qrcode/021fI1iv1lah1w38">`，
+    /// 编号每次刷新都会变，所以必须现取现用。
+    pub fn wechat_qr_uuid(&self) -> Result<String, DsError> {
+        let res = self
+            .http
+            .get(SIGN_IN_URL)
+            .headers(self.build_headers(None, None, false))
+            .send()
+            .map_err(|e| DsError::Other(format!("打开登录页失败：{e}")))?;
+        let html = res.text().unwrap_or_default();
+        let uuid = after_key(&html, "/connect/qrcode/").ok_or_else(|| DsError::Api {
+            code: -1,
+            message: "登录页里没找到 /connect/qrcode 的二维码地址".to_string(),
+        })?;
+        Ok(uuid)
+    }
+
+    /// 去微信取二维码图片（open.weixin.qq.com 直接返回图片字节）
+    pub fn wechat_qr_png(&self, uuid: &str) -> Result<Vec<u8>, DsError> {
+        let res = self
+            .http
+            .get(format!("https://open.weixin.qq.com/connect/qrcode/{uuid}"))
+            .headers(self.build_headers(None, None, false))
+            .send()
+            .map_err(|e| DsError::Other(format!("下载二维码失败：{e}")))?;
+        if !res.status().is_success() {
+            return Err(DsError::Api {
                 code: -1,
-                message: format!("响应里没有二维码地址，原始内容：{data}"),
-            })?;
-        let id = ["qrcode_id", "qr_code_id", "ticket", "id"]
-            .iter()
-            .find_map(|k| data.get(*k).and_then(|v| v.as_str()))
-            .unwrap_or_default()
-            .to_string();
-        Ok((url, id))
+                message: format!("下载二维码失败：HTTP {}", res.status().as_u16()),
+            });
+        }
+        res.bytes()
+            .map(|b| b.to_vec())
+            .map_err(|e| DsError::Other(format!("读取二维码失败：{e}")))
+    }
+
+    /// 轮询扫码状态，返回微信的 errcode。
+    /// 约定：408 未扫码 · 404 已扫待确认 · 405 已确认（附带 wx_code）· 403 过期或取消。
+    pub fn wechat_scan_state(&self, uuid: &str) -> Result<(i32, String), DsError> {
+        let res = self
+            .http
+            .get(format!(
+                "https://long.open.weixin.qq.com/connect/l/qrconnect?uuid={uuid}&_={}",
+                crate::auth::now_ms()
+            ))
+            .headers(self.build_headers(None, None, false))
+            .send()
+            .map_err(|e| DsError::Other(format!("轮询扫码状态失败：{e}")))?;
+        let text = res.text().unwrap_or_default();
+        let code = after_key(&text, "wx_errcode=")
+            .and_then(|s| s.parse::<i32>().ok())
+            .unwrap_or(0);
+        let wx_code = after_key(&text, "wx_code='").unwrap_or_default();
+        Ok((code, wx_code))
+    }
+
+    /// 用微信给的 code 换 userToken。
+    ///
+    /// **路径未能核实** —— 扫码那一段（取编号 → 取图片 → 轮询 errcode）都是真的，
+    /// 但最后这一步 DeepSeek 拿什么接口换 token 无从查证，这里按同类接口推测。
+    /// 跑不通时错误信息里会带服务端原始响应，照着改一行即可。
+    pub fn login_by_wechat(&self, wx_code: &str, device_id: &str) -> Result<String, DsError> {
+        let data = self.post_json(
+            EP_WECHAT_LOGIN,
+            "",
+            &json!({ "code": wx_code, "device_id": device_id, "os": "web" }),
+        )?;
+        dig_token(&data).ok_or_else(|| DsError::Api {
+            code: -1,
+            message: format!("微信登录响应里没有 token，原始内容：{data}"),
+        })
     }
 
     /// 创建会话

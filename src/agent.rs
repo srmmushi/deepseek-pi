@@ -49,6 +49,8 @@ pub enum UiEvent {
     },
     /// 非致命提示
     Notice(String),
+    /// 登录流程在后台拿到了 userToken，交给主循环保存
+    Token(String),
     /// 致命错误（已翻译成可读文案）
     Error(String),
     /// 凭证失效，界面应清掉本地凭证

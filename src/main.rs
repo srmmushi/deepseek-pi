@@ -360,6 +360,11 @@ fn event_loop(
             while let Ok(ev) = receiver.try_recv() {
                 match &ev {
                     UiEvent::Finished => done = true,
+                    // 扫码流程在后台拿到了凭证，这里落地
+                    UiEvent::Token(token) => {
+                        let token = token.clone();
+                        do_login(core, app, &token);
+                    }
                     UiEvent::AuthFailed => {
                         // 界面已经提示过了，这里只负责清掉本地凭证
                         core.token = None;
@@ -474,7 +479,7 @@ fn submit(core: &mut Core, app: &mut App, input: String, rx: &mut Option<Receive
     app.line_styled(format!("❯ {trimmed}"), ui::user_style());
 
     if trimmed.starts_with('/') {
-        command(trimmed, core, app);
+        command(trimmed, core, app, rx);
     } else if let Some(cmd) = trimmed.strip_prefix('!') {
         shell(cmd.trim(), core, app);
     } else {
@@ -571,7 +576,12 @@ fn shell(command: &str, core: &Core, app: &mut App) {
     );
 }
 
-fn command(input: &str, core: &mut Core, app: &mut App) {
+fn command(
+    input: &str,
+    core: &mut Core,
+    app: &mut App,
+    rx: &mut Option<Receiver<UiEvent>>,
+) {
     let mut it = input.splitn(2, char::is_whitespace);
     let cmd = it.next().unwrap_or("").to_ascii_lowercase();
     let arg = it.next().unwrap_or("").trim().to_string();
@@ -760,7 +770,7 @@ fn command(input: &str, core: &mut Core, app: &mut App) {
                     app.start_login(false);
                     app.line_styled("输入手机号或邮箱，回车继续（Esc 取消）", ui::dim());
                 }
-                "wechatqr" | "wechat" | "qr" => login_with_wechat_qr(core, app),
+                "wechatqr" | "wechat" | "qr" => login_with_wechat_qr(core, app, rx),
                 // 兼容旧写法 /login <userToken>
                 other if other.len() >= 16 && !other.contains(' ') => do_login(core, app, other),
                 _ => {
@@ -837,8 +847,11 @@ fn do_password_login(core: &mut Core, app: &mut App, account: &str, password: &s
     }
 }
 
-/// 微信扫码登录：把二维码画在终端里
-fn login_with_wechat_qr(core: &mut Core, app: &mut App) {
+/// 微信扫码登录。
+///
+/// 整个流程丢到后台线程做（取编号 → 下载图片 → 轮询扫码状态 → 换 token），
+/// 结果用 UiEvent 回传，界面照常刷新，不会在等扫码的时候卡死。
+fn login_with_wechat_qr(core: &mut Core, app: &mut App, rx: &mut Option<Receiver<UiEvent>>) {
     let client = match core.client() {
         Ok(c) => c,
         Err(e) => {
@@ -847,31 +860,115 @@ fn login_with_wechat_qr(core: &mut Core, app: &mut App) {
         }
     };
     let device_id = core.device_id();
-    match client.wechat_qrcode(&device_id) {
-        Ok((content, _id)) => {
-            app.line("");
-            match render_qr(&content) {
-                Ok(art) => {
-                    for line in art {
-                        app.line(line);
-                    }
-                }
-                Err(e) => app.line_styled(format!("二维码渲染失败：{e}"), ui::err()),
-            }
-            app.line("");
-            app.line_styled("用微信扫码并在手机上确认。", ui::ok());
-        }
-        Err(e) => {
-            app.line_styled(format!("获取二维码失败：{e}"), ui::err());
-            app.line_styled(
-                "这个接口路径我没能离线核实，把上面原文发我即可修正。",
-                ui::dim(),
-            );
-        }
-    }
+    let (tx, receiver): (Sender<UiEvent>, Receiver<UiEvent>) = mpsc::channel();
+    *rx = Some(receiver);
+    app.line_styled("正在获取微信二维码…", ui::dim());
+    std::thread::spawn(move || {
+        wechat_login_worker(&client, &device_id, &tx);
+        let _ = tx.send(UiEvent::Finished);
+    });
 }
 
-/// 把二维码画成终端字符画（Dense1x2：一个字符高塞两行，手机扫得动）
+/// 后台线程：取码 → 画出来 → 轮询 → 过期就换一张 → 拿到 code 换 token
+fn wechat_login_worker(client: &DeepSeekClient, device_id: &str, tx: &Sender<UiEvent>) {
+    // 一张码大约两分钟，最多换 5 张
+    for round in 1..=5 {
+        let uuid = match client.wechat_qr_uuid() {
+            Ok(u) => u,
+            Err(e) => {
+                let _ = tx.send(UiEvent::Error(format!("获取二维码编号失败：{e}")));
+                return;
+            }
+        };
+        let png = match client.wechat_qr_png(&uuid) {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = tx.send(UiEvent::Error(format!("下载二维码图片失败：{e}")));
+                return;
+            }
+        };
+
+        let _ = tx.send(UiEvent::Line(String::new()));
+        match qr_art_from_png(&png) {
+            Ok(art) => {
+                for line in art {
+                    let _ = tx.send(UiEvent::Line(line));
+                }
+            }
+            Err(e) => {
+                let _ = tx.send(UiEvent::Error(format!("二维码渲染失败：{e}")));
+                return;
+            }
+        }
+        let _ = tx.send(UiEvent::Line(String::new()));
+        let _ = tx.send(UiEvent::Notice(format!(
+            "第 {round} 张码：用微信扫上面这个二维码，并在手机上确认"
+        )));
+
+        // 每 2 秒问一次，单张码最多等 90 秒
+        let mut scanned = false;
+        for _ in 0..45 {
+            std::thread::sleep(Duration::from_secs(2));
+            match client.wechat_scan_state(&uuid) {
+                // 405 = 已确认，带 wx_code
+                Ok((405, code)) if !code.is_empty() => {
+                    let _ = tx.send(UiEvent::Notice("已确认，正在换取凭证…".to_string()));
+                    match client.login_by_wechat(&code, device_id) {
+                        Ok(token) => {
+                            let _ = tx.send(UiEvent::Token(token));
+                            return;
+                        }
+                        Err(e) => {
+                            let _ = tx.send(UiEvent::Error(format!("换取凭证失败：{e}")));
+                            let _ = tx.send(UiEvent::Line(
+                                "这一步的接口路径我查不到，上面是服务端原文，发我即可修正。"
+                                    .to_string(),
+                            ));
+                            return;
+                        }
+                    }
+                }
+                // 403 = 过期或被取消
+                Ok((403, _)) => break,
+                // 404 = 已扫待确认
+                Ok((404, _)) => {
+                    if !scanned {
+                        scanned = true;
+                        let _ = tx.send(UiEvent::Notice("已扫码，请在手机上确认登录".to_string()));
+                    }
+                }
+                // 408 = 还没扫，继续等
+                Ok(_) => {}
+                Err(e) => {
+                    let _ = tx.send(UiEvent::Error(format!("轮询扫码状态失败：{e}")));
+                    return;
+                }
+            }
+        }
+        let _ = tx.send(UiEvent::Notice("二维码已过期，重新获取…".to_string()));
+    }
+    let _ = tx.send(UiEvent::Error(
+        "连着几张二维码都过期了，稍后再试 /login wechatqr".to_string(),
+    ));
+}
+
+/// 把二维码图片解码出内容，再用 qrcode 重画成终端字符画。
+///
+/// 不直接缩放像素：图片里有多少像素、留了多宽的白边都不确定，
+/// 缩放比例一旦和模块数对不上，画出来的二维码就扫不出来了。
+/// 解出内容重画才能保证每个模块正好一个格。
+fn qr_art_from_png(png: &[u8]) -> Result<Vec<String>, String> {
+    let img = image::load_from_memory(png)
+        .map_err(|e| e.to_string())?
+        .to_luma8();
+    let mut prepared = rqrr::PreparedImage::prepare(img);
+    let grids = prepared.detect_grids();
+    let grid = grids.first().ok_or_else(|| "图片里没找到二维码".to_string())?;
+    let (_meta, content) = grid.decode().map_err(|e| format!("解码二维码失败：{e}"))?;
+    render_qr(&content)
+}
+
+/// 把二维码内容画成终端字符画（Dense1x2：一个字符高塞两行，手机扫得动）
 fn render_qr(content: &str) -> Result<Vec<String>, String> {
     let code = qrcode::QrCode::new(content.as_bytes()).map_err(|e| e.to_string())?;
     let art = code.render::<qrcode::render::unicode::Dense1x2>().build();

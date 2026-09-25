@@ -304,6 +304,8 @@ impl App {
                 self.busy = false;
             }
             UiEvent::Notice(text) => self.line_styled(format!("! {text}"), warn()),
+            // 凭证由主循环落地，界面不显示原文
+            UiEvent::Token(_) => {}
             UiEvent::Error(text) => {
                 self.busy = false;
                 self.think_since = None;

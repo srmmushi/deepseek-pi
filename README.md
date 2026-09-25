@@ -58,7 +58,7 @@ cargo build --release            # 产物：target/release/dsp
 /login            打开登录页（同 /login browser）
 /login token      手动粘贴 userToken（输入掩码显示）
 /login passwd     手机号 / 邮箱 + 密码（两步输入，密码掩码）
-/login wechatqr   微信扫码，二维码直接画在终端里
+/login wechatqr   微信扫码：二维码画在终端里，过期自动换一张，确认后自动写入凭证
 ```
 
 `/login browser` 用自动识别出的浏览器打开 `chat.deepseek.com/sign_in`：
@@ -67,9 +67,29 @@ cargo build --release            # 产物：target/release/dsp
 
 加密格式固定不变，所以磁盘上已有的凭证可以直接复用 —— `--selftest` 就是确认这件事的。
 
-> `/login passwd` 与 `/login wechatqr` 依赖网页端的私有接口（DeepSeek 没有公开文档）。
-> 密码登录的 `/api/v0/users/login` 有第三方项目佐证；**微信扫码那个路径我没能核实**，
-> 属于按同类接口形状的推测。失败时两者都会把服务端原始响应打出来，照着改一行即可。
+### 微信扫码是怎么走的
+
+```text
+GET  chat.deepseek.com/sign_in
+       └─ 从 HTML 里抠出 <img class="js_qrcode" src="/connect/qrcode/<编号>">
+GET  open.weixin.qq.com/connect/qrcode/<编号>      ← 微信直接返回二维码图片
+       └─ 解出二维码内容，再用 qrcode 重画成终端字符画
+轮询 long.open.weixin.qq.com/connect/l/qrconnect?uuid=<编号>
+       └─ 408 未扫 · 404 已扫待确认 · 405 已确认（带 wx_code）· 403 过期
+       └─ 403 就换一张码重来，405 则拿 wx_code 去换 userToken
+```
+
+取编号、下图片、轮询 errcode 这三步都是按网页端真实行为实现的；**只有最后用
+`wx_code` 换 `userToken` 那个路径查不到**（DeepSeek 没有公开文档），是按同类接口
+的形状推测的。跑不通时错误信息会带上服务端原始响应，照着改一行即可。
+
+二维码图片不直接缩放像素 —— 图片里模块数和白边都不确定，缩放比例一旦和模块数对不上
+就扫不出来了；所以先用 `rqrr` 解出内容，再用 `qrcode` 重画，保证每个模块正好一个格。
+
+整个流程跑在后台线程、结果通过事件回传，所以等扫码的时候界面照常响应，
+不会卡死。
+
+> `/login passwd` 用的 `/api/v0/users/login` 有第三方项目佐证，比上面的换 token 那步可靠。
 
 ## 快捷键
 
