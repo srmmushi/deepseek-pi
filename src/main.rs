@@ -6,6 +6,7 @@ mod deepseek;
 mod i18n;
 mod prompt;
 mod stream;
+mod sysinfo;
 mod tools;
 mod ui;
 
@@ -33,12 +34,13 @@ const HELP: &str = "\
 DSP (deepseek-pi) —— 终端编程助手，仅使用 DeepSeek 网页版
 
 用法
-  dsp [--config-dir <path>] [--resume] [--selftest]
+  dsp [--config-dir <path>] [--resume] [--selftest] [--info]
 
 选项
   -c, --config-dir <path>   配置目录（默认 ~/.pi/agent，也可用 PI_CONFIG_DIR）
       --resume              接着最近一次会话继续
       --selftest            只做自检：打印机器指纹并尝试解密已保存的凭证
+      --info                只打印环境信息（同 /info）后退出，不进界面
   -h, --help                显示本帮助
 
 快捷键
@@ -52,7 +54,13 @@ DSP (deepseek-pi) —— 终端编程助手，仅使用 DeepSeek 网页版
 
 命令
   /help /login /logout /thinking /search /thinking-view /model /lang
-  /status /sessions /session /clear /goto /quit
+  /status /sessions /session /clear /goto /info /browser /open /quit
+
+环境
+  /info              系统、架构、构建号、浏览器；WSL 下会同时列出容器内与宿主机的浏览器
+  /browser [n|auto]  选择用哪个浏览器，n 是 /info 里列出的序号
+  /open [url]        用选定的浏览器打开网页（默认 chat.deepseek.com）
+  Ctrl+T / Ctrl+S    切换深度思考 / 智能搜索（状态栏显示当前值，不打断输出）
 
 登录
   Rust 版不做浏览器自动化。三种方式任选：
@@ -68,6 +76,7 @@ struct Args {
     command: Option<String>,
     resume: bool,
     selftest: bool,
+    info: bool,
     help: bool,
 }
 
@@ -78,6 +87,7 @@ fn parse_args(argv: &[String]) -> Args {
         match argv[i].as_str() {
             "--help" | "-h" => args.help = true,
             "--selftest" => args.selftest = true,
+            "--info" => args.info = true,
             "--resume" => args.resume = true,
             "--config-dir" | "-c" => {
                 if let Some(v) = argv.get(i + 1) {
@@ -107,6 +117,15 @@ fn main() {
     }
 
     let paths = config::resolve_paths(args.config_dir.as_deref());
+    if args.info {
+        // 与 /info 同一份内容，但不需要进 TUI —— 也方便贴到 bug 报告里
+        let config = config::load_config(&paths);
+        let dir = paths.config_dir.display().to_string();
+        for line in sysinfo::report(&dir, &config.browser, config.language) {
+            println!("{line}");
+        }
+        return;
+    }
     if args.selftest {
         std::process::exit(selftest(&paths));
     }
@@ -333,11 +352,11 @@ fn event_loop(
             match toggle {
                 ui::Toggle::Thinking => {
                     core.config.thinking = !core.config.thinking;
-                    after_toggle(core, app, "toggle.thinking", core.config.thinking);
+                    after_toggle(core, app, "toggle.thinking", core.config.thinking, true);
                 }
                 ui::Toggle::Search => {
                     core.config.search = !core.config.search;
-                    after_toggle(core, app, "toggle.search", core.config.search);
+                    after_toggle(core, app, "toggle.search", core.config.search, true);
                 }
             }
         }
@@ -500,6 +519,104 @@ fn command(input: &str, core: &mut Core, app: &mut App) {
                 app.line(line);
             }
         }
+        "/info" => {
+            let dir = core.paths.config_dir.display().to_string();
+            let browser = core.config.browser.clone();
+            for line in sysinfo::report(&dir, &browser, lang) {
+                app.line(line);
+            }
+        }
+        "/browser" => {
+            let list = sysinfo::detect_browsers();
+            let in_wsl = sysinfo::wsl_version().is_some();
+            if list.is_empty() {
+                app.line_styled(
+                    if lang == Lang::Zh {
+                        "没有检测到可用浏览器。"
+                    } else {
+                        "No browser found."
+                    },
+                    ui::warn(),
+                );
+            } else if arg.is_empty() {
+                let current = sysinfo::resolve(&list, &core.config.browser).unwrap_or(0);
+                for (n, b) in list.iter().enumerate() {
+                    let mark = if n == current { "*" } else { " " };
+                    app.line(format!(
+                        "{mark} [{}] {}",
+                        n + 1,
+                        sysinfo::describe(b, in_wsl, lang)
+                    ));
+                }
+                app.line_styled(
+                    if lang == Lang::Zh {
+                        "用 /browser <序号> 选定；/browser auto 交回自动"
+                    } else {
+                        "use /browser <n> to pick; /browser auto to reset"
+                    },
+                    ui::dim(),
+                );
+            } else if arg.eq_ignore_ascii_case("auto") {
+                core.config.browser.clear();
+                core.persist();
+                let idx = sysinfo::resolve(&list, "").unwrap_or(0);
+                app.line_styled(
+                    format!(
+                        "浏览器：自动 → {}",
+                        sysinfo::describe(&list[idx], in_wsl, lang)
+                    ),
+                    ui::ok(),
+                );
+            } else {
+                match sysinfo::resolve(&list, &arg) {
+                    Some(i) => {
+                        core.config.browser = list[i].id.clone();
+                        core.persist();
+                        app.line_styled(
+                            format!("浏览器已切换为 {}", sysinfo::describe(&list[i], in_wsl, lang)),
+                            ui::ok(),
+                        );
+                    }
+                    None => app.line_styled(
+                        if lang == Lang::Zh {
+                            "序号无效，先输入 /browser 看列表。"
+                        } else {
+                            "Invalid index; run /browser to list them."
+                        },
+                        ui::warn(),
+                    ),
+                }
+            }
+        }
+        "/open" => {
+            let url = if arg.is_empty() {
+                "https://chat.deepseek.com".to_string()
+            } else {
+                arg.clone()
+            };
+            let list = sysinfo::detect_browsers();
+            let in_wsl = sysinfo::wsl_version().is_some();
+            match sysinfo::resolve(&list, &core.config.browser) {
+                Some(i) => match sysinfo::open_url(&list[i], &url) {
+                    Ok(()) => app.line_styled(
+                        format!(
+                            "已用 {} 打开 {url}",
+                            sysinfo::describe(&list[i], in_wsl, lang)
+                        ),
+                        ui::ok(),
+                    ),
+                    Err(e) => app.line_styled(format!("打开浏览器失败：{e}"), ui::err()),
+                },
+                None => app.line_styled(
+                    if lang == Lang::Zh {
+                        "没有可用浏览器，输入 /info 看看环境。"
+                    } else {
+                        "No browser available; run /info."
+                    },
+                    ui::warn(),
+                ),
+            }
+        }
         "/quit" | "/exit" => app.quit = true,
         "/clear" => {
             let cwd = core.session.lock().unwrap().cwd.clone();
@@ -510,11 +627,11 @@ fn command(input: &str, core: &mut Core, app: &mut App) {
         }
         "/thinking" => {
             core.config.thinking = toggle(&arg).unwrap_or(!core.config.thinking);
-            after_toggle(core, app, "toggle.thinking", core.config.thinking);
+            after_toggle(core, app, "toggle.thinking", core.config.thinking, false);
         }
         "/search" => {
             core.config.search = toggle(&arg).unwrap_or(!core.config.search);
-            after_toggle(core, app, "toggle.search", core.config.search);
+            after_toggle(core, app, "toggle.search", core.config.search, false);
         }
         "/thinking-view" => {
             core.config.show_thinking = toggle(&arg).unwrap_or(!core.config.show_thinking);
@@ -673,9 +790,16 @@ fn do_login(core: &mut Core, app: &mut App, token: &str) {
     }
 }
 
-fn after_toggle(core: &mut Core, app: &mut App, key: &str, value: bool) {
+/// 落地一个开关。
+///
+/// `quiet` 给 Ctrl+T / Ctrl+S 用：状态栏那一行本来就写着「Ctrl+T 深度思考 开」，
+/// 再往输出区插一行只会把正文冲散，所以快捷键路径不打印，命令路径保留回显。
+fn after_toggle(core: &mut Core, app: &mut App, key: &str, value: bool, quiet: bool) {
     core.persist();
     app.set_status(core.status_text());
+    if quiet {
+        return;
+    }
     app.line_styled(
         format!("{} {}", core.t(key), on_off(core.lang, value)),
         ui::dim(),

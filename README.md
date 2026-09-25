@@ -82,8 +82,38 @@ token 取自 `chat.deepseek.com` 的 LocalStorage（key 是 `userToken`）。
 
 ```
 /help /login /logout /thinking /search /thinking-view /model /lang
-/status /sessions /session /clear /goto /system-prompt /quit
+/status /sessions /session /clear /goto /system-prompt
+/info /browser /open /quit
 ```
+
+### 环境与浏览器
+
+`/info` 打印当前环境，`dsp --info` 是同一份内容但不进界面（贴 bug 报告方便）：
+
+```text
+环境信息
+  程序版本    dsp 0.1.0 (release)
+  操作系统    Ubuntu 24.04.1 LTS
+  构建号      24.04
+  内核        Linux 5.15.167.4-microsoft-standard-WSL2
+  架构        x86_64 / linux
+  主机名      DESKTOP-XXXX
+  配置目录    /home/me/.pi/agent
+  虚拟机      WSL2（Windows 构建 10.0.22631.4317）
+  浏览器      宿主机 Chrome  /mnt/c/Program Files/Google/Chrome/Application/chrome.exe
+
+  检测到 WSL：可指定用「容器内」还是「宿主机」的浏览器
+  * [1] 宿主机 Chrome    /mnt/c/Program Files/Google/Chrome/Application/chrome.exe
+    [2] 容器内 系统默认   /usr/bin/xdg-open
+  输入 /browser <序号> 选定；/browser auto 交回自动
+```
+
+`虚拟机` 一行**只在识别到 WSL 时出现**，其他系统不输出。
+WSL 下容器和宿主机是两套环境，容器里往往根本没装浏览器，所以列出来让你选：
+`/browser 2` 选定、`/browser auto` 交回自动。Windows / macOS / 原生 Linux 直接自动识别
+（Windows 查 `Program Files`，macOS 查 `/Applications`，Linux 扫 `PATH`）。
+
+`/open [url]` 用选定的浏览器打开网页，默认 `chat.deepseek.com` —— 取 userToken 时省得手敲。
 
 `!<命令>` 直接跑 shell，输出只打印、**不进对话上下文**（不消耗 token）：
 

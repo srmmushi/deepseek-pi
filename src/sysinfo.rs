@@ -1,0 +1,394 @@
+//! 运行环境识别：系统 / 架构 / 构建号、WSL 判定、浏览器探测与打开。
+//!
+//! 只服务于 `/info`、`/browser`、`/open`，不参与对话流程。
+//!
+//! 浏览器这一块是重点：WSL 下同时能看见「容器里的浏览器」和
+//! 「Windows 宿主机里的浏览器」，两者差别很大（容器里往往根本没装），
+//! 所以列出来让用户选；其他系统直接自动识别即可。
+
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+
+use crate::config::Lang;
+
+/// 当前运行环境
+pub struct EnvInfo {
+    pub app_version: String,
+    pub os_name: String,
+    /// 系统构建号：Windows/WSL 取 Windows 版本号，Linux 取 os-release 的 BUILD_ID/VERSION_ID
+    pub build: String,
+    /// 内核（`uname -sr`）
+    pub kernel: String,
+    pub arch: String,
+    pub host: String,
+    /// Some("WSL2") 表示跑在 WSL 里；不是 WSL 就是 None
+    pub wsl: Option<String>,
+    /// WSL 下 Windows 自己的构建号
+    pub windows_build: Option<String>,
+}
+
+/// 一个可用的浏览器
+#[derive(Clone)]
+pub struct Browser {
+    pub id: String,
+    pub label: String,
+    pub path: PathBuf,
+    /// true = Windows 宿主机里的浏览器（只可能是 WSL 下的产物）
+    pub host: bool,
+}
+
+/// Windows 上的常见浏览器：id、名字、是否装在 Program Files (x86)、相对路径
+const WIN_BROWSERS: &[(&str, &str, bool, &str)] = &[
+    ("chrome", "Chrome", false, "Google/Chrome/Application/chrome.exe"),
+    ("edge", "Edge", true, "Microsoft/Edge/Application/msedge.exe"),
+    ("firefox", "Firefox", false, "Mozilla Firefox/firefox.exe"),
+    ("brave", "Brave", false, "BraveSoftware/Brave-Browser/Application/brave.exe"),
+];
+
+/// Linux / 容器里的常见浏览器命令
+const UNIX_BROWSERS: &[(&str, &str)] = &[
+    ("google-chrome", "Chrome"),
+    ("google-chrome-stable", "Chrome"),
+    ("chromium", "Chromium"),
+    ("chromium-browser", "Chromium"),
+    ("microsoft-edge", "Edge"),
+    ("brave-browser", "Brave"),
+    ("firefox", "Firefox"),
+];
+
+/// macOS 的浏览器不是命令行，只能给 .app 里的可执行文件完整路径
+const MAC_BROWSERS: &[(&str, &str, &str)] = &[
+    ("chrome", "Chrome", "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+    ("edge", "Edge", "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+    ("firefox", "Firefox", "/Applications/Firefox.app/Contents/MacOS/firefox"),
+    ("brave", "Brave", "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"),
+];
+
+// ── 环境信息 ─────────────────────────────────────────────────
+
+pub fn collect() -> EnvInfo {
+    let wsl = wsl_version();
+    EnvInfo {
+        app_version: format!(
+            "{} {} ({})",
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION"),
+            if cfg!(debug_assertions) { "debug" } else { "release" }
+        ),
+        os_name: os_name(),
+        build: os_build(),
+        kernel: kernel(),
+        arch: format!("{} / {}", std::env::consts::ARCH, std::env::consts::OS),
+        host: hostname::get()
+            .map(|h| h.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "unknown".to_string()),
+        windows_build: wsl.as_ref().and_then(|_| ver_build()),
+        wsl,
+    }
+}
+
+/// WSL 判定。只认 WSL：内核串里带 microsoft/wsl 就算。
+pub fn wsl_version() -> Option<String> {
+    if let Ok(text) = std::fs::read_to_string("/proc/version") {
+        let lower = text.to_lowercase();
+        if lower.contains("microsoft") || lower.contains("wsl") {
+            return Some(if lower.contains("wsl2") { "WSL2" } else { "WSL1" }.to_string());
+        }
+    }
+    // 兜底：这个环境变量只有 WSL 会设
+    std::env::var("WSL_DISTRO_NAME").ok().map(|_| "WSL".to_string())
+}
+
+fn os_name() -> String {
+    if cfg!(target_os = "windows") {
+        // 具体版本号单独给「构建号」一行，这里不重复
+        return "Windows".to_string();
+    }
+    if let Ok(text) = std::fs::read_to_string("/etc/os-release") {
+        if let Some(v) = os_release_field(&text, "PRETTY_NAME") {
+            return v;
+        }
+    }
+    std::env::consts::OS.to_string()
+}
+
+fn os_build() -> String {
+    // 只有原生 Windows 才把「系统构建号」当成 Windows 版本号；
+    // WSL 下 操作系统 与 构建号 都应该描述发行版，Windows 版本号归到「虚拟机」那行
+    if cfg!(target_os = "windows") {
+        if let Some(b) = ver_build() {
+            return b;
+        }
+    }
+    if let Ok(text) = std::fs::read_to_string("/etc/os-release") {
+        if let Some(v) =
+            os_release_field(&text, "BUILD_ID").or_else(|| os_release_field(&text, "VERSION_ID"))
+        {
+            return v;
+        }
+    }
+    String::new()
+}
+
+fn kernel() -> String {
+    if cfg!(unix) {
+        if let Ok(out) = Command::new("uname").arg("-sr").output() {
+            if out.status.success() {
+                return String::from_utf8_lossy(&out.stdout).trim().to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+/// 取 os-release 里的某个字段，顺手去掉引号
+fn os_release_field(text: &str, key: &str) -> Option<String> {
+    text.lines()
+        .find_map(|line| line.strip_prefix(key)?.strip_prefix('='))
+        .map(|v| v.trim().trim_matches('"').to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// Windows 版本号。WSL 下靠 cmd.exe 问宿主机，输出形如
+/// `Microsoft Windows [Version 10.0.22631.4317]`
+fn ver_build() -> Option<String> {
+    let exe = if wsl_version().is_some() { "cmd.exe" } else { "cmd" };
+    let out = Command::new(exe).args(["/c", "ver"]).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let start = text.find("[Version ")? + "[Version ".len();
+    let end = text[start..].find(']')? + start;
+    Some(text[start..end].trim().to_string())
+}
+
+// ── 浏览器 ───────────────────────────────────────────────────
+
+/// 探测可用的浏览器。WSL 下既找容器里的，也找 `/mnt/c` 下宿主机的。
+pub fn detect_browsers() -> Vec<Browser> {
+    let mut out = Vec::new();
+    let in_wsl = wsl_version().is_some();
+
+    // 1) 当前系统 / 容器里的浏览器
+    for (cmd, label) in UNIX_BROWSERS {
+        if let Some(path) = which(cmd) {
+            out.push(Browser {
+                id: (*cmd).to_string(),
+                label: (*label).to_string(),
+                path,
+                host: false,
+            });
+        }
+    }
+    if out.is_empty() {
+        // 容器里没装浏览器也没关系，把 URL 交给系统默认处理
+        for (cmd, label) in [("xdg-open", "系统默认"), ("wslview", "宿主机默认")] {
+            if let Some(path) = which(cmd) {
+                out.push(Browser {
+                    id: cmd.to_string(),
+                    label: label.to_string(),
+                    path,
+                    host: false,
+                });
+            }
+        }
+    }
+    if cfg!(target_os = "macos") {
+        for (id, label, path) in MAC_BROWSERS {
+            let p = PathBuf::from(*path);
+            if p.exists() {
+                out.push(Browser {
+                    id: (*id).to_string(),
+                    label: (*label).to_string(),
+                    path: p,
+                    host: false,
+                });
+            }
+        }
+    }
+
+    // 2) Windows 里的浏览器：WSL 下走 /mnt/c，原生 Windows 走 Program Files
+    for (id, label, x86, rel) in WIN_BROWSERS {
+        let root = if in_wsl {
+            Some(PathBuf::from(if *x86 {
+                "/mnt/c/Program Files (x86)"
+            } else {
+                "/mnt/c/Program Files"
+            }))
+        } else if cfg!(target_os = "windows") {
+            program_files(*x86)
+        } else {
+            None
+        };
+        let Some(root) = root else { continue };
+        let path = root.join(*rel);
+        if path.exists() {
+            out.push(Browser {
+                id: format!("host:{id}"),
+                label: if in_wsl {
+                    format!("宿主机 {label}")
+                } else {
+                    (*label).to_string()
+                },
+                path,
+                host: in_wsl,
+            });
+        }
+    }
+
+    out
+}
+
+/// 按保存的取值找一个浏览器。支持：空/`auto`、序号（从 1 开始，与 /info 一致）、id
+pub fn resolve(list: &[Browser], choice: &str) -> Option<usize> {
+    let choice = choice.trim();
+    if choice.is_empty() || choice == "auto" {
+        return prefer_auto(list);
+    }
+    if let Ok(n) = choice.parse::<usize>() {
+        return if n >= 1 && n <= list.len() { Some(n - 1) } else { None };
+    }
+    list.iter().position(|b| b.id == choice)
+}
+
+/// 自动选择：WSL 下容器里往往没装浏览器，所以优先宿主机；否则取第一个
+fn prefer_auto(list: &[Browser]) -> Option<usize> {
+    list.iter()
+        .position(|b| b.host)
+        .or(if list.is_empty() { None } else { Some(0) })
+}
+
+/// 用指定浏览器打开 URL。全部都是「URL 作为第一个参数」的调用形式。
+pub fn open_url(browser: &Browser, url: &str) -> std::io::Result<()> {
+    Command::new(&browser.path)
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
+}
+
+/// 一行描述（给 /info 与 /browser 用）
+pub fn describe(browser: &Browser, in_wsl: bool, lang: Lang) -> String {
+    let zh = lang == Lang::Zh;
+    let kind = match (browser.host, in_wsl, zh) {
+        (true, _, true) => "宿主机",
+        (true, _, false) => "host",
+        (false, true, true) => "容器内",
+        (false, true, false) => "container",
+        (false, false, true) => "本机",
+        (false, false, false) => "local",
+    };
+    format!("{kind} {}  {}", browser.label, browser.path.display())
+}
+
+/// 在 PATH 里找一个可执行文件
+fn which(cmd: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(cmd))
+        .find(|p| p.is_file())
+}
+
+fn program_files(x86: bool) -> Option<PathBuf> {
+    let key = if x86 { "ProgramFiles(x86)" } else { "ProgramFiles" };
+    std::env::var(key).ok().filter(|v| !v.is_empty()).map(PathBuf::from)
+}
+
+// ── /info 输出 ───────────────────────────────────────────────
+
+/// 生成 `/info` 的多行输出（已排版好）
+pub fn report(config_dir: &str, chosen: &str, lang: Lang) -> Vec<String> {
+    let zh = lang == Lang::Zh;
+    let info = collect();
+    let list = detect_browsers();
+    let in_wsl = info.wsl.is_some();
+
+    let mut out = vec![String::new()];
+    out.push((if zh { "环境信息" } else { "Environment" }).to_string());
+
+    let l_app = if zh { "程序版本" } else { "Version" };
+    let l_os = if zh { "操作系统" } else { "OS" };
+    let l_build = if zh { "构建号" } else { "Build" };
+    let l_kernel = if zh { "内核" } else { "Kernel" };
+    let l_arch = if zh { "架构" } else { "Arch" };
+    let l_host = if zh { "主机名" } else { "Host" };
+    let l_vm = if zh { "虚拟机" } else { "VM" };
+    let l_dir = if zh { "配置目录" } else { "Config dir" };
+    let l_browser = if zh { "浏览器" } else { "Browser" };
+
+    out.push(format!("  {}{}", pad(l_app, 12), info.app_version));
+    out.push(format!("  {}{}", pad(l_os, 12), info.os_name));
+    if !info.build.is_empty() {
+        out.push(format!("  {}{}", pad(l_build, 12), info.build));
+    }
+    if !info.kernel.is_empty() {
+        out.push(format!("  {}{}", pad(l_kernel, 12), info.kernel));
+    }
+    out.push(format!("  {}{}", pad(l_arch, 12), info.arch));
+    out.push(format!("  {}{}", pad(l_host, 12), info.host));
+    out.push(format!("  {}{}", pad(l_dir, 12), config_dir));
+
+    // 虚拟机：只识别 WSL，其他系统不输出这一行
+    if let Some(vm) = &info.wsl {
+        let extra = match &info.windows_build {
+            Some(b) if zh => format!("（Windows 构建 {b}）"),
+            Some(b) => format!(" (Windows build {b})"),
+            None => String::new(),
+        };
+        out.push(format!("  {}{vm}{extra}", pad(l_vm, 12)));
+    }
+
+    // 浏览器
+    if list.is_empty() {
+        out.push(format!(
+            "  {}{}",
+            pad(l_browser, 12),
+            if zh { "未检测到可用浏览器" } else { "no browser found" }
+        ));
+        return out;
+    }
+    let idx = resolve(&list, chosen).unwrap_or_else(|| prefer_auto(&list).unwrap_or(0));
+    let auto = chosen.trim().is_empty() || chosen.trim() == "auto";
+    let mark = if auto {
+        if zh { "（自动）" } else { " (auto)" }
+    } else {
+        ""
+    };
+    out.push(format!(
+        "  {}{}{mark}",
+        pad(l_browser, 12),
+        describe(&list[idx], in_wsl, lang)
+    ));
+
+    // WSL 下容器/宿主机差异很大，列出来让用户选
+    if in_wsl && list.len() > 1 {
+        out.push(String::new());
+        out.push(
+            (if zh {
+                "  检测到 WSL：可指定用「容器内」还是「宿主机」的浏览器"
+            } else {
+                "  WSL detected: pick a container or host browser"
+            })
+            .to_string(),
+        );
+        for (n, b) in list.iter().enumerate() {
+            let cur = if n == idx { "*" } else { " " };
+            out.push(format!("  {cur} [{}] {}", n + 1, describe(b, in_wsl, lang)));
+        }
+        out.push(format!(
+            "  {}",
+            if zh {
+                "输入 /browser <序号> 选定；/browser auto 交回自动"
+            } else {
+                "use /browser <n> to pick; /browser auto to reset"
+            }
+        ));
+    }
+    out
+}
+
+/// 按显示宽度补空格（中文算 2 列），让中英双语都对得齐
+fn pad(label: &str, width: usize) -> String {
+    let w: usize = label.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum();
+    format!("{label}{}", " ".repeat(width.saturating_sub(w)))
+}
