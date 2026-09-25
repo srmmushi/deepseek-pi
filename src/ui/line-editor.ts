@@ -17,6 +17,28 @@ export interface EditorKey {
 	sequence: string;
 }
 
+/** 鼠标事件（SGR 扩展模式） */
+export interface MouseEvent {
+	/** 0 左键 · 1 中键 · 2 右键 · 64 上滚 · 65 下滚 */
+	button: number;
+	/** 列号（1 起） */
+	x: number;
+	/** 行号（1 起） */
+	y: number;
+	/** 是否为抬起事件 */
+	release: boolean;
+}
+
+/** SGR 鼠标序列：\x1b[<b;x;yM（按下）或 m（抬起） */
+const MOUSE_RE = /^\u001b\[<(\d+);(\d+);(\d+)([Mm])$/;
+
+/** 解析鼠标序列；不是鼠标事件时返回 undefined */
+export function parseMouse(sequence: string): MouseEvent | undefined {
+	const m = MOUSE_RE.exec(sequence);
+	if (!m) return undefined;
+	return { button: Number(m[1]), x: Number(m[2]), y: Number(m[3]), release: m[4] === "m" };
+}
+
 export interface LineEditorOptions {
 	/** 提示符（可带 ANSI 颜色） */
 	prompt: string;
@@ -24,6 +46,8 @@ export interface LineEditorOptions {
 	onKey?: (key: EditorKey, line: string) => boolean;
 	/** 非输入状态（例如流式输出中）的按键回调 */
 	onIdleKey?: (key: EditorKey) => void;
+	/** 鼠标事件回调（需调用方先开启鼠标跟踪）；输入中与输出中都会触发 */
+	onMouse?: (event: MouseEvent) => void;
 }
 
 const MAX_HISTORY = 200;
@@ -164,6 +188,13 @@ export class LineEditor {
 
 	private handleKeypress = (str: string, key: EditorKey): void => {
 		if (!key) return;
+
+		// 鼠标事件优先处理（输入中与输出中都要响应点击折叠）
+		const mouse = parseMouse(key.sequence ?? str);
+		if (mouse) {
+			this.options.onMouse?.(mouse);
+			return;
+		}
 
 		// 非输入状态（流式输出中）：交给外部处理中断/开关
 		if (!this.active) {

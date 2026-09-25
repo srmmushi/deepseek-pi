@@ -13,28 +13,34 @@
 //   !xxx     → 直接执行 shell 命令，结果只打印，不进入对话上下文
 //
 // 字形约定（一律不用 emoji，避免终端把符号渲染成彩色表情导致对不齐）：
-//   ▌ 工具调用      └ 工具结果      · 元信息
+//   ▌ 工具调用 / 思考      └ 工具结果      · 元信息
+//
+// 折叠：思考与 exec 输出都是「块」，点击块头（或 Ctrl+O）展开 / 收起。
+// 滚动区域里的历史行无法单独擦除，所以主输出同时记入块渲染器的缓冲区，
+// 折叠时整体重排并重绘可见窗口 —— 详见 ui/renderer.ts。
 //
 // ⚠ 列偏移陷阱（曾导致输出覆盖已有内容）：
 //   raw 模式下 \n 只换行、不回列（Windows 上 libuv 会设 DISABLE_NEWLINE_AUTO_RETURN），
 //   若某一行不先 \r 归位，列偏移会逐行累积，长行折行后越过滚动区域底边，
-//   整屏就开始互相覆盖。因此：主输出统一走 info()，内容行自行补 \r，
-//   并由 statusbar.anchorCursor() 在每行写入前把光标钉回「滚动区域底部第 1 列」。
+//   整屏就开始互相覆盖。因此主输出统一走 info()，并由状态栏在每行写入前
+//   把光标钉回「滚动区域底部第 1 列」。
 import type { App } from "../app.js";
 import { isAuthError } from "../deepseek/provider.js";
 import { runShell } from "../tools/exec.js";
-import { describeCall, type ToolCall, type ToolName } from "../tools/index.js";
-import { APP_FULL_NAME, APP_NAME, printBanner } from "../ui/banner.js";
-import { LineEditor, type EditorKey } from "../ui/line-editor.js";
+import { describeCall, type ToolCall, type ToolName, type ToolResult } from "../tools/index.js";
+import { APP_FULL_NAME, APP_NAME, bannerLines } from "../ui/banner.js";
+import { LineEditor, type EditorKey, type MouseEvent } from "../ui/line-editor.js";
 import {
 	color,
-	endLiveLine,
+	disableMouse,
+	enableMouse,
 	error as printError,
 	info,
 	setOutputAnchor,
 	writeLiveLine,
 } from "../ui/output.js";
 import { formatHint, printCommandPalette } from "../ui/palette.js";
+import { createRenderer, type Renderer } from "../ui/renderer.js";
 import { createStatusBar } from "../ui/statusbar.js";
 import { alignRight, displayWidth, formatDuration, truncateTo } from "../ui/text.js";
 import { suggestCommands } from "./command-specs.js";
@@ -55,9 +61,11 @@ const GLYPH_META = "·";
 
 /** 工具名对齐列宽（最长的是 search） */
 const TOOL_NAME_WIDTH = 6;
-
-/** 思考回放最多显示的行数（防止一次刷屏） */
-const MAX_THINK_REPLAY_LINES = 300;
+/** 思考 spinner 帧与刷新间隔 */
+const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SPINNER_INTERVAL_MS = 90;
+/** exec 输出超过这个行数时默认收起 */
+const EXEC_COLLAPSE_LINES = 6;
 
 /** 按工具类型配色，一眼区分「读 / 写 / 列目录 / 执行 / 搜索」 */
 const TOOL_COLOR: Record<ToolName, (text: string) => string> = {
@@ -67,6 +75,34 @@ const TOOL_COLOR: Record<ToolName, (text: string) => string> = {
 	exec: color.yellow,
 	search: color.magenta,
 };
+
+/** 主输出门面：TTY 下走块渲染器（可折叠 + 整体重绘），否则逐行打印 */
+interface Emitter {
+	line(text: string): void;
+	/** 可折叠块：非 TTY 下没有折叠概念，展开态直接铺开 */
+	block(head: string, body: string[], collapsed: boolean): void;
+}
+
+function createEmitter(render: Renderer | null): Emitter {
+	return {
+		line(text) {
+			if (render) render.line(text);
+			else info(text);
+		},
+		block(head, body, collapsed) {
+			if (!render) {
+				info(head);
+				if (!collapsed) for (const line of body) info(line);
+				return;
+			}
+			if (body.length === 0) {
+				info(head);
+				return;
+			}
+			render.block(head, body, collapsed);
+		},
+	};
+}
 
 /** 跨轮共享的界面状态 */
 interface UiState {
@@ -114,29 +150,47 @@ function toolResultLine(prefix: string, summary: string, ok: boolean, elapsedMs:
 	return alignRight(`${head}${truncateTo(body, room)}`, right);
 }
 
+/** 思考全文 → 带缩进的正文行 */
+function thinkBody(text: string): string[] {
+	return text
+		.split("\n")
+		.filter((line) => line.trim() !== "")
+		.map((line) => color.gray(`    ${line}`));
+}
+
+/** 从 exec 的工具结果里提取可展示的输出体（去掉 [exec] 与退出码两行） */
+function execBody(result: ToolResult): string[] {
+	const lines = result.output.split("\n");
+	const body = lines.slice(2);
+	while (body.length > 0 && body[body.length - 1].trim() === "") body.pop();
+	return body.map((line) => color.dim(`    ${line}`));
+}
+
 /** 执行 `!命令`：直接跑 shell，输出只打印不进对话上下文 */
-async function runShellLine(app: App, command: string): Promise<void> {
+async function runShellLine(app: App, emit: Emitter, command: string): Promise<void> {
 	const { t } = app.i18n;
 	if (!command) {
-		info(`  ${color.dim(t("shell.usage"))}`);
+		emit.line(`  ${color.dim(t("shell.usage"))}`);
 		return;
 	}
-	info();
-	info(`  ${color.yellow(GLYPH_CALL)} ${color.yellow(command)}`);
+	emit.line("");
+	emit.line(`  ${color.yellow(GLYPH_CALL)} ${color.yellow(command)}`);
 	const result = await runShell(command, app.cwd);
-	if (result.output) {
-		for (const line of result.output.split("\n")) info(`  ${line}`);
-	} else {
-		info(color.dim(`  ${t("shell.noOutput")}`));
-	}
+	const body = result.output ? result.output.split("\n").map((line) => `  ${line}`) : [];
+	if (body.length === 0) body.push(color.dim(`  ${t("shell.noOutput")}`));
 	const state = result.ok
 		? color.green(t("shell.exit", { code: 0 }))
 		: color.red(t("shell.exit", { code: result.code }));
-	info(alignRight(`  ${color.dim(GLYPH_RESULT)} ${state}`, color.dim(formatDuration(result.durationMs))));
+	const head = alignRight(
+		`  ${color.dim(GLYPH_RESULT)} ${state}`,
+		color.dim(formatDuration(result.durationMs)),
+	);
+	// shell 输出同样可折叠（超过阈值默认收起）
+	emit.block(head, body, body.length > EXEC_COLLAPSE_LINES);
 }
 
 /** 构造本轮的渲染回调（Agent 风格：▌ 工具 / └ 结果 / 折叠思考） */
-function createTurnIO(app: App, ui: UiState): TurnIO {
+function createTurnIO(app: App, ui: UiState, emit: Emitter, foldable: boolean): TurnIO {
 	const { t } = app.i18n;
 	const turnStartedAt = Date.now();
 	/** 当前并行批次 */
@@ -145,57 +199,71 @@ function createTurnIO(app: App, ui: UiState): TurnIO {
 	let batchDone = 0;
 	/** 本次思考的显示状态 */
 	let thinkFolded = true;
-	let thinkChars = 0;
-	let thinkPaintedAt = 0;
+	let thinkStartedAt = turnStartedAt;
+	let spinTimer: ReturnType<typeof setInterval> | null = null;
+	let spinFrame = 0;
+
+	const stopSpinner = (): void => {
+		if (spinTimer !== null) {
+			clearInterval(spinTimer);
+			spinTimer = null;
+		}
+	};
+
+	/** 原地刷新「⠋ Thinking 2.1s」活动行 */
+	const paintSpinner = (): void => {
+		const sec = ((Date.now() - thinkStartedAt) / 1000).toFixed(1);
+		const frame = SPINNER[spinFrame % SPINNER.length];
+		spinFrame += 1;
+		writeLiveLine(
+			`  ${color.cyan(frame)} ${color.dim(t("repl.thinkingLabel"))} ${color.dim(`${sec}s`)}`,
+		);
+	};
 
 	return {
-		// ── 思考：折叠时只维护一行实时指示，展开时逐字流式 ──
+		// ── 思考：默认不展示正文，只显示 spinner 活动行 ──
 		onThinkStart() {
-			thinkChars = 0;
-			thinkPaintedAt = 0;
+			thinkStartedAt = Date.now();
+			spinFrame = 0;
 			thinkFolded = !app.config.showThinking;
 			if (!thinkFolded) {
-				info();
+				emit.line("");
 				process.stdout.write(`  ${color.dim(GLYPH_CALL)} ${color.dim(t("repl.thinkingLabel"))}  `);
-			}
-		},
-		onThinkDelta(text) {
-			thinkChars += text.length;
-			if (!thinkFolded) {
-				process.stdout.write(color.gray(text));
 				return;
 			}
-			// 折叠态：节流刷新单行指示，避免逐字重绘造成的闪烁
-			const now = Date.now();
-			if (now - thinkPaintedAt < 100) return;
-			thinkPaintedAt = now;
-			writeLiveLine(
-				`  ${color.dim(GLYPH_CALL)} ${color.dim(t("repl.thinkingLive", { chars: thinkChars }))}`,
-			);
+			// 非 TTY 没有「活动行」，结束时打一行摘要即可
+			if (!foldable) return;
+			paintSpinner();
+			spinTimer = setInterval(paintSpinner, SPINNER_INTERVAL_MS);
+		},
+		onThinkDelta(text) {
+			if (!thinkFolded) process.stdout.write(color.gray(text));
+			// 折叠态不显示正文：spinner 已在跑，正文只在块里留存
 		},
 		onThinkEnd(fullText, elapsedMs) {
-			ui.lastThinking = fullText;
+			stopSpinner();
 			const summary = t("repl.thinkingDone", {
 				sec: formatDuration(elapsedMs),
 				chars: fullText.length,
 			});
-			const hint = t(thinkFolded ? "repl.expand" : "repl.collapse");
-			if (thinkFolded) {
-				// 折叠：把活动行就地定稿为一行摘要
-				endLiveLine(`  ${color.dim(GLYPH_CALL)} ${color.dim(summary)} ${color.dim(`· ${hint}`)}`);
+			if (!thinkFolded) {
+				process.stdout.write("\r\n");
+				emit.line(`  ${color.dim(GLYPH_RESULT)} ${color.dim(`${summary} · ${t("repl.collapse")}`)}`);
 				return;
 			}
-			process.stdout.write("\r\n");
-			info(`  ${color.dim(GLYPH_RESULT)} ${color.dim(`${summary} · ${hint}`)}`);
+			ui.lastThinking = fullText;
+			// 折叠块头会覆盖掉相同位置的活动行（首行写入即覆盖）
+			const head = `  ${color.dim(GLYPH_CALL)} ${color.dim(summary)} ${color.dim(`· ${t("repl.expand")}`)}`;
+			emit.block(head, thinkBody(fullText), true);
 		},
 
 		// ── 正文 ──
 		onContentStart() {
-			info();
+			emit.line("");
 		},
 		onContentDelta(text) {
-			// 每个内容行都先 \r 归位：raw 模式下 \n 不回列，不归位会逐行右移
-			process.stdout.write(`\r${text}`);
+			// 内容按整行到达（loop 已按行切分），去掉尾部换行后逐行入库
+			emit.line(text.replace(/\n$/, ""));
 		},
 
 		// ── 工具：一批调用先列出，结果按完成顺序打印 ──
@@ -203,18 +271,20 @@ function createTurnIO(app: App, ui: UiState): TurnIO {
 			batch = calls;
 			batchDone = 0;
 			batchStartedAt = Date.now();
-			info();
-			for (const call of calls) info(toolCallLine(call));
+			emit.line("");
+			for (const call of calls) emit.line(toolCallLine(call));
 		},
 		onToolEnd(call, result, elapsedMs) {
 			batchDone += 1;
 			// 并行批次里结果顺序与调用顺序不一致，必须带工具名才好对应
-			const prefix =
-				batch.length > 1 ? color.dim(call.name.padEnd(TOOL_NAME_WIDTH)) : "";
-			info(toolResultLine(prefix, result.summary, result.ok, elapsedMs));
+			const prefix = batch.length > 1 ? color.dim(call.name.padEnd(TOOL_NAME_WIDTH)) : "";
+			const head = toolResultLine(prefix, result.summary, result.ok, elapsedMs);
+			// exec 输出折叠：行数多时默认收起，点击块头展开
+			const body = call.name === "exec" && result.ok ? execBody(result) : [];
+			emit.block(head, body, body.length > EXEC_COLLAPSE_LINES);
 			if (batchDone >= batch.length && batch.length > 1) {
 				const span = formatDuration(Date.now() - batchStartedAt);
-				info(`  ${color.dim(`${GLYPH_META} ${t("repl.parallel", { n: batch.length })}  ·  ${span}`)}`);
+				emit.line(`  ${color.dim(`${GLYPH_META} ${t("repl.parallel", { n: batch.length })}  ·  ${span}`)}`);
 			}
 		},
 
@@ -222,10 +292,11 @@ function createTurnIO(app: App, ui: UiState): TurnIO {
 			const parts: string[] = [];
 			if (usage != null) parts.push(`${usage} ${t("status.tokens")}`);
 			parts.push(formatDuration(Date.now() - turnStartedAt));
-			info(`\n  ${color.dim(`${GLYPH_META} ${parts.join("  ·  ")}`)}`);
+			emit.line("");
+			emit.line(`  ${color.dim(`${GLYPH_META} ${parts.join("  ·  ")}`)}`);
 		},
 		onNotice(text) {
-			info(`  ${color.yellow(`! ${text}`)}`);
+			emit.line(`  ${color.yellow(`! ${text}`)}`);
 		},
 	};
 }
@@ -235,24 +306,33 @@ export async function startRepl(app: App): Promise<void> {
 	const { t } = app.i18n;
 	const ui: UiState = { lastThinking: "" };
 
+	// ── 底部状态栏与块渲染器 ──────────────────────────────
+	const bar = createStatusBar();
+	const render = bar.enabled
+		? createRenderer({ height: () => bar.height(), width: () => bar.width() })
+		: null;
+	const emit = createEmitter(render);
+	const defaultHint = color.dim("─".repeat(240));
+	let paletteShownFor: string | undefined;
+
 	// ── 启动头部：极简，仅 ASCII 字形 + 登录状态 ──────────
+	// 经由 emit 写入，这样它也在渲染器缓冲区里，整体重绘时不会被擦掉
 	const token = app.getToken();
 	const stateText = token
 		? color.green(`✓ ${t("ui.loginOk", { len: token.length })}`)
 		: color.yellow(`✗ ${t("ui.loginMissing")}`);
-	printBanner([
+	for (const line of bannerLines([
 		"",
 		`${color.bold(APP_NAME)}  ${color.dim(`(${APP_FULL_NAME})`)}`,
 		stateText,
-	]);
+	])) {
+		emit.line(line);
+	}
 
-	// ── 底部状态栏 ────────────────────────────────────────
-	const bar = createStatusBar();
-	// 主输出每行写入前，把光标钉回滚动区域底部第 1 列（防列偏移累积 / 防越界）
+	// 初始化滚动区域（此前无 anchor，banner 正常写在顶部），再挂上光标归位
+	bar.set(defaultHint, statusLine(app));
 	setOutputAnchor(bar.enabled ? () => bar.anchorCursor() : null);
-	// 默认提示行是一条分隔线（把输入区与状态栏隔开）；输入 / 时替换为补全项
-	const defaultHint = color.dim("─".repeat(240));
-	let paletteShownFor: string | undefined;
+	if (!bar.enabled) info(statusLine(app));
 
 	/** 刷新底部状态栏；非 TTY 时降级为一次性打印状态行 */
 	const refreshUi = (): void => {
@@ -292,7 +372,7 @@ export async function startRepl(app: App): Promise<void> {
 	const showPalette = (): void => {
 		// 先清掉输入行 → 把命令面板打印到主输出区 → 再重绘输入行
 		editor.erase();
-		printCommandPalette(app.i18n.lang);
+		printCommandPalette(app.i18n.lang, emit.line);
 		editor.redraw();
 		bar.refresh();
 	};
@@ -330,28 +410,32 @@ export async function startRepl(app: App): Promise<void> {
 		const next = !app.config.showThinking;
 		app.setShowThinking(next);
 		editor.erase();
-		info();
-		info(
+		emit.line("");
+		emit.line(
 			`  ${color.dim(
 				t("toggle.thinkingView", { state: next ? t("status.on") : t("status.off") }),
 			)}`,
 		);
 		if (next) {
-			const text = ui.lastThinking;
-			if (!text) {
-				info(color.dim(`  ${t("repl.noThinking")}`));
-			} else {
-				info();
-				const lines = text.split("\n");
-				const shown = lines.slice(0, MAX_THINK_REPLAY_LINES);
-				for (const line of shown) info(color.gray(`  ${line}`));
-				if (lines.length > shown.length) {
-					info(color.dim(`  ${t("repl.expanded")}`));
-				}
-			}
+			const body = thinkBody(ui.lastThinking);
+			if (body.length === 0) emit.line(color.dim(`  ${t("repl.noThinking")}`));
+			else for (const line of body) emit.line(line);
 		}
 		editor.redraw();
 		bar.set(defaultHint, barStatus());
+	};
+
+	/** 鼠标点击：命中可折叠块头则切换折叠 */
+	const onMouse = (event: MouseEvent): void => {
+		if (event.release || event.button !== 0 || !render) return;
+		// 面板两行不属于主输出
+		if (event.y > bar.height()) return;
+		const block = render.blockAtRow(event.y);
+		if (!block) return;
+		editor.erase();
+		render.toggle(block);
+		bar.refresh();
+		editor.redraw();
 	};
 
 	const editor = new LineEditor({
@@ -386,15 +470,18 @@ export async function startRepl(app: App): Promise<void> {
 			if (key.ctrl && key.name === "t") toggle("thinking");
 			else if (key.ctrl && key.name === "s") toggle("search");
 		},
+		onMouse,
 	});
+	// 开启鼠标跟踪，让「点击块头折叠」可用（退出时必须关闭，否则会吞掉拖选）
+	if (bar.enabled) enableMouse();
 	refreshUi();
-	if (!bar.enabled) info(statusLine(app));
 
 	// ── 尺寸变化 ──────────────────────────────────────────
-	// 顺序很重要：handleResize 会重建滚动区域并把光标重新锚定到底部，
-	// 之后才能安全地重算提示行与重绘输入行（否则输入行会漂到旧位置）。
+	// 顺序很重要：handleResize 重建滚动区域并重新锚定光标，
+	// 之后按新宽度整体重排可见窗口，最后重绘输入行。
 	process.stdout.on("resize", () => {
 		bar.handleResize();
+		render?.repaint();
 		updateHint();
 		editor.redraw();
 	});
@@ -406,13 +493,14 @@ export async function startRepl(app: App): Promise<void> {
 		cleaned = true;
 		stopBusyTimer();
 		setOutputAnchor(null);
+		disableMouse();
 		editor.dispose();
 		bar.dispose();
 	};
 	process.on("exit", cleanup);
 
 	// ── 主循环 ────────────────────────────────────────────
-	const io = { print: (text?: string) => info(text ?? "") };
+	const io = { print: (text?: string) => emit.line(text ?? "") };
 
 	try {
 		for (;;) {
@@ -428,7 +516,7 @@ export async function startRepl(app: App): Promise<void> {
 
 			// `!命令`：直接执行 shell，不进入对话上下文
 			if (trimmed.startsWith("!")) {
-				await runShellLine(app, trimmed.slice(1).trim());
+				await runShellLine(app, emit, trimmed.slice(1).trim());
 				refreshUi();
 				continue;
 			}
@@ -455,10 +543,10 @@ export async function startRepl(app: App): Promise<void> {
 			activeAbort = controller;
 			setBusy(true);
 			try {
-				await runTurn(app, trimmed, createTurnIO(app, ui), controller.signal);
+				await runTurn(app, trimmed, createTurnIO(app, ui, emit, render !== null), controller.signal);
 			} catch (e) {
 				if (controller.signal.aborted) {
-					info(color.dim(`  ${t("repl.stopped")}`));
+					emit.line(color.dim(`  ${t("repl.stopped")}`));
 				} else {
 					// token 失效时清掉本地凭证，避免"看起来已登录、实际用不了"
 					if (isAuthError(e)) app.clearAuthStore();
@@ -474,6 +562,6 @@ export async function startRepl(app: App): Promise<void> {
 		cleanup();
 	}
 
-	info();
-	info(color.dim(`  ${t("app.bye")}`));
+	emit.line("");
+	emit.line(color.dim(`  ${t("app.bye")}`));
 }

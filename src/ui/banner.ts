@@ -18,13 +18,20 @@ const ART = [
 ];
 
 /**
- * 打印 banner。
+ * 生成 banner 的每一行。
+ * 交给块渲染器逐行纳入缓冲区（否则整体重绘时会把 banner 擦掉）。
  * @param right 右栏文字（按行对齐，空字符串表示留白），由调用方按语言传入
  */
-export function printBanner(right: string[] = []): void {
-	info();
+export function bannerLines(right: string[] = []): string[] {
+	const lines = [""];
 	ART.forEach((row, index) => {
-		info(`  ${color.cyan(row)}   ${color.dim(right[index] ?? "")}`);
+		lines.push(`  ${color.cyan(row)}   ${color.dim(right[index] ?? "")}`);
 	});
-	info();
+	lines.push("");
+	return lines;
+}
+
+/** 直接打印 banner（非块渲染路径使用） */
+export function printBanner(right: string[] = []): void {
+	for (const line of bannerLines(right)) info(line);
 }

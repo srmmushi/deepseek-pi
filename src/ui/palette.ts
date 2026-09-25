@@ -7,21 +7,24 @@ import { padTo } from "./text.js";
 /** 命令名一列的宽度 */
 const NAME_COLUMN = 32;
 
-/** 打印完整命令面板（输入 `/` 时调用，写入主输出区） */
-export function printCommandPalette(lang: Lang): void {
-	info();
-	info(`  ${color.bold(lang === "zh" ? "可用命令" : "Available commands")}`);
+/**
+ * 打印完整命令面板（输入 `/` 时调用，写入主输出区）。
+ * @param write 输出通道；TTY 下由块渲染器接管，保证面板也进入重绘缓冲区
+ */
+export function printCommandPalette(lang: Lang, write: (text: string) => void = info): void {
+	write("");
+	write(`  ${color.bold(lang === "zh" ? "可用命令" : "Available commands")}`);
 	for (const spec of COMMAND_SPECS) {
-		info(`  ${color.cyan(padTo(usageOf(spec), NAME_COLUMN))}${color.dim(describeOf(spec, lang))}`);
+		write(`  ${color.cyan(padTo(usageOf(spec), NAME_COLUMN))}${color.dim(describeOf(spec, lang))}`);
 	}
-	info();
+	write("");
 	// 非斜杠命令：! 前缀直接执行 shell
 	const shellDesc =
 		lang === "zh"
 			? "直接执行 shell 命令，例如 !git status"
 			: "Run a shell command, e.g. !git status";
-	info(`  ${color.yellow(padTo("!<command>", NAME_COLUMN))}${color.dim(shellDesc)}`);
-	info();
+	write(`  ${color.yellow(padTo("!<command>", NAME_COLUMN))}${color.dim(shellDesc)}`);
+	write("");
 }
 
 /** 生成底部提示行的补全文本（单行，超长由状态栏自行截断） */

@@ -90,6 +90,19 @@ export function endLine(): void {
 	process.stdout.write("\r\n");
 }
 
+/**
+ * 开启鼠标跟踪（SGR 扩展模式，能拿到精确的行列坐标）。
+ * 注意：开启后终端会用鼠标事件代替「拖选文本」，退出前**必须**调用 disableMouse()。
+ */
+export function enableMouse(): void {
+	if (isTty) process.stdout.write("\u001b[?1000h\u001b[?1006h");
+}
+
+/** 关闭鼠标跟踪（恢复终端的原生拖选行为） */
+export function disableMouse(): void {
+	if (isTty) process.stdout.write("\u001b[?1000l\u001b[?1006l");
+}
+
 /** 覆盖当前行（用于刷新状态栏） */
 export function overwriteLine(text: string): void {
 	process.stdout.write(`\r\u001b[2K${text}`);

@@ -26,6 +26,10 @@ export interface StatusBar {
 	refresh(): void;
 	/** 把光标归位到滚动区域底部第 1 列（主输出每行写前调用，防止列偏移累积） */
 	anchorCursor(): void;
+	/** 可见区域高度（= 滚动区域底部行号），供块渲染器重绘时使用 */
+	height(): number;
+	/** 终端列数 */
+	width(): number;
 	/** 终端尺寸变化后：重建滚动区域、重新锚定光标、重绘面板 */
 	handleResize(): void;
 	/** 退出前恢复终端（重置滚动区域并清空面板） */
@@ -107,6 +111,12 @@ export function createStatusBar(): StatusBar {
 		anchorCursor(): void {
 			if (!enabled) return;
 			out.write(`\u001b[${scrollBottom()};1H`);
+		},
+		height(): number {
+			return scrollBottom();
+		},
+		width(): number {
+			return cols();
 		},
 		handleResize(): void {
 			if (!enabled) return;
