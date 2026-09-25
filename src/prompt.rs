@@ -140,7 +140,8 @@ pub fn build_tool_doc(lang: Lang) -> String {
             "你可以调用以下工具来完成任务。调用时严格使用如下格式：\n\n\
 写入文件（一次完整的写入操作）：\n\
 write:\"文件内容\",文件路径\n\
-示例：write:\"console.log('hello')\",src/index.js\n\n\
+示例：write:\"console.log('hello')\",src/index.js\n\
+内容可以包含换行，缩进会原样保留 —— 直接写成多行，不要为了塞进一行而压缩代码。\n\n\
 读取文件：\nread:文件路径\n示例：read:src/index.js\n\n\
 列出目录：\nlist:目录路径\n示例：list:src\n\n\
 执行命令：\nexec:命令\n示例：exec:npm install\n\n\
@@ -152,7 +153,9 @@ write:\"文件内容\",文件路径\n\
         Lang::En => format!(
             "You can call the following tools. Use EXACTLY this format:\n\n\
 Write a file (a full overwrite, not append): write:\"file content\",path\n\
-Example: write:\"console.log('hello')\",src/index.js\n\n\
+Example: write:\"console.log('hello')\",src/index.js\n\
+The content may span multiple lines; indentation is preserved as-is —\n\
+write it as real multi-line text instead of compressing it onto one line.\n\n\
 Read a file: read:path\nExample: read:src/index.js\n\n\
 List a directory: list:path\nExample: list:src\n\n\
 Run a command: exec:command\nExample: exec:npm install\n\n\

@@ -56,12 +56,14 @@ DSP (deepseek-pi) —— 终端编程助手，仅使用 DeepSeek 网页版
 
 命令
   /help /login /logout /new /session /clear /goto /thinking /search
-  /model /lang /status /info /open /system-prompt /quit
+  /model /lang /status /info /open /export /system-prompt /quit
 
 会话
   /new               新建会话（清空上下文）
-  /session           列出所有历史会话
+  /session           列出当前目录的会话
+  /session all       列出全部会话（附路径，按终端宽度收窄）
   /session <序号>    进入该会话并载入上下文
+  /export            把本次会话导出成 Markdown（写在当前目录）
 
 环境
   /info              系统、架构、构建号（当前那次 git 提交）、主机名；WSL 才显示虚拟机
@@ -773,33 +775,63 @@ fn command(
                 None => app.line_styled(format!("  {}", core.t("ui.loginMissing")), ui::warn()),
             }
         }
-        // /session 不带参数列会话，带编号进入该会话并载入上下文
+        // /session            只列当前目录的会话
+        // /session all        列出全部会话（附路径，按终端宽度收窄）
+        // /session <编号>     进入该会话并载入上下文
         "/session" => {
+            let cwd = core.session.lock().unwrap().cwd.clone();
             let all = Session::list(&core.paths.sessions_dir);
-            if arg.is_empty() {
+            let mine: Vec<Session> = all
+                .iter()
+                .filter(|s| s.cwd == cwd)
+                .cloned()
+                .collect();
+            let width = crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(80);
+
+            if arg.eq_ignore_ascii_case("all") {
                 if all.is_empty() {
                     app.line_styled("暂无历史会话。", ui::dim());
                 } else {
-                    app.line_styled(format!("历史会话（{}）", all.len()), ui::user_style());
+                    app.line_styled(
+                        format!("全部会话（{}）· 当前目录 {} 条", all.len(), mine.len()),
+                        ui::user_style(),
+                    );
                     for (i, s) in all.iter().enumerate() {
+                        let dir = ui::shorten_path(&s.cwd.display().to_string(), width / 2);
+                        app.line(format!("  #{:<3}{:<22}{dir}", i + 1, truncate(&s.title, 20)));
+                    }
+                    app.line_styled("/session <序号> 进入（序号按当前目录的列表算）。", ui::dim());
+                }
+            } else if arg.is_empty() {
+                if mine.is_empty() {
+                    app.line_styled(
+                        "当前目录暂无历史会话（/session all 看全部）。",
+                        ui::dim(),
+                    );
+                } else {
+                    app.line_styled(
+                        format!("当前目录的会话（{}）", mine.len()),
+                        ui::user_style(),
+                    );
+                    for (i, s) in mine.iter().enumerate() {
                         app.line(format!(
                             "  #{:<3}{:<24}{} 条消息",
                             i + 1,
-                            s.title,
+                            truncate(&s.title, 22),
                             s.messages.len()
                         ));
                     }
                     app.line_styled("用 /session <序号> 进入该会话并载入上下文。", ui::dim());
                 }
             } else {
-                let index: usize = match arg.trim_start_matches('#').parse::<usize>() {
-                    Ok(n) if n >= 1 && n <= all.len() => n - 1,
+                let index = match arg.trim_start_matches('#').parse::<usize>() {
+                    Ok(n) if n >= 1 && n <= mine.len() => n - 1,
                     _ => {
                         app.line_styled("序号无效，输入 /session 看列表。", ui::warn());
                         return;
                     }
                 };
-                let picked = all[index].clone();
+                let picked = mine[index].clone();
                 let count = picked.messages.len();
                 core.session_title = picked.title.clone();
                 *core.session.lock().unwrap() = picked;
@@ -810,6 +842,17 @@ fn command(
                     format!("已进入 {}（载入 {count} 条上下文）", core.session_title),
                     ui::ok(),
                 );
+            }
+        }
+        "/export" => {
+            let session = core.session.lock().unwrap().clone();
+            let path = session.cwd.join(format!("dsp-{}.md", session.id));
+            match export_markdown(&session, &path) {
+                Ok(()) => app.line_styled(
+                    format!("已导出 {}（{} 条消息）", path.display(), session.messages.len()),
+                    ui::ok(),
+                ),
+                Err(e) => app.line_styled(format!("导出失败：{e}"), ui::err()),
             }
         }
         "/new" => {
@@ -1151,6 +1194,34 @@ fn help_style(line: &str) -> ratatui::style::Style {
         return Style::default().fg(Color::Magenta);
     }
     Style::default().fg(Color::Gray)
+}
+
+/// 按字符数截断，超出加省略号
+fn truncate(text: &str, max: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max {
+        text.to_string()
+    } else {
+        format!("{}…", chars[..max].iter().collect::<String>())
+    }
+}
+
+/// /export：把这次会话的上下文导出成一份 Markdown
+fn export_markdown(session: &Session, path: &std::path::Path) -> std::io::Result<()> {
+    let mut out = String::new();
+    out.push_str(&format!("# {}\n\n", session.title));
+    out.push_str(&format!("- 会话 ID：`{}`\n", session.id));
+    out.push_str(&format!("- 工作目录：`{}`\n", session.cwd.display()));
+    out.push_str(&format!("- 消息数：{}\n\n---\n\n", session.messages.len()));
+    for (role, content) in &session.messages {
+        let who = match role.as_str() {
+            "user" => "用户",
+            "assistant" => "助手",
+            _ => "工具结果",
+        };
+        out.push_str(&format!("## {who}\n\n{content}\n\n"));
+    }
+    std::fs::write(path, out)
 }
 
 /// 落地一个开关。

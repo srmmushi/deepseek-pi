@@ -222,28 +222,61 @@ fn build_call(name: &str, rest: &str) -> Result<ToolCall, String> {
 }
 
 /// 从 assistant 文本中解析全部工具调用（只识别单独成行的调用，忽略代码围栏）
+///
+/// `write` 的正文允许跨多行 —— 写文件时内容本来就有换行，如果只认单行，
+/// 模型会被迫把整个文件压成一行（缩进全丢，还要多花几万 token 思考）。
+/// 所以 write 解析不完整时继续往下拼，直到拼出完整的 `write:"…",路径`。
 pub fn parse_tool_calls(text: &str) -> ParseResult {
     let mut result = ParseResult::default();
-    for (index, raw_line) in text.lines().enumerate() {
-        let line = raw_line.trim();
+    let lines: Vec<&str> = text.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i].trim();
         if line.is_empty() || line.starts_with("```") {
+            i += 1;
             continue;
         }
         let lower = line.to_ascii_lowercase();
         let Some(colon) = lower.find([':', '：']) else {
+            i += 1;
             continue;
         };
         let head = &lower[..colon];
         if ToolName::parse(head).is_none() {
+            i += 1;
             continue;
         }
         // 用原串切片，保留大小写与内容
-        let rest = &line[colon + line[colon..].chars().next().map(|c| c.len_utf8()).unwrap_or(1)..];
-        let rest = rest.trim();
-        match build_call(head, rest) {
-            Ok(call) => result.calls.push(call),
-            Err(err) => result.errors.push(format!("第 {} 行：[{head}] {err}", index + 1)),
+        let offset = colon + line[colon..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        let mut body = line[offset..].trim().to_string();
+        let start_line = i + 1;
+
+        let mut call = build_call(head, &body);
+        if head == "write" {
+            let mut used = 0;
+            while call.is_err() && i + 1 < lines.len() && used < 2000 {
+                let next = lines[i + 1].trim();
+                // 撞上另一个工具调用，说明已经吃过头了
+                if next
+                    .split([':', '：'])
+                    .next()
+                    .is_some_and(|h| ToolName::parse(h.trim()).is_some())
+                {
+                    break;
+                }
+                i += 1;
+                used += 1;
+                body.push('\n');
+                body.push_str(lines[i]);
+                call = build_call(head, &body);
+            }
         }
+
+        match call {
+            Ok(call) => result.calls.push(call),
+            Err(err) => result.errors.push(format!("第 {start_line} 行：[{head}] {err}")),
+        }
+        i += 1;
     }
     result
 }

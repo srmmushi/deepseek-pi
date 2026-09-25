@@ -33,7 +33,8 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ("/login", "登录（浏览器 / token / 账密 / 微信扫码）", "sign in"),
     ("/logout", "清除本地凭证", "clear credentials"),
     ("/new", "新建会话（清屏并清空上下文）", "new session"),
-    ("/session", "列出历史会话；带编号进入并载入上下文", "list or enter a session"),
+    ("/session", "列出当前目录的会话；带编号进入、all 看全部", "list or enter a session"),
+    ("/export", "把本次会话导出成 Markdown", "export this session to Markdown"),
     ("/clear", "清空当前会话的上下文", "clear context"),
     ("/goto", "跳转到某条提示词", "jump to a prompt"),
     ("/thinking", "开关深度思考", "toggle thinking"),
@@ -825,6 +826,27 @@ impl App {
             1
         }
     }
+}
+
+/// 路径按显示宽度压到 `width` 列内，超出部分用 ... 从**前面**省略
+/// （末级目录和文件名比顶层更有信息量）。
+pub fn shorten_path(path: &str, width: usize) -> String {
+    let total: usize = path.chars().map(App::char_width).sum();
+    if total <= width || width < 10 {
+        return path.to_string();
+    }
+    let mut room = width.saturating_sub(3);
+    let mut tail: Vec<char> = Vec::new();
+    for c in path.chars().rev() {
+        let w = App::char_width(c);
+        if w > room {
+            break;
+        }
+        room -= w;
+        tail.push(c);
+    }
+    tail.reverse();
+    format!("...{}", tail.into_iter().collect::<String>())
 }
 
 /// 显示列 → 字符下标。
