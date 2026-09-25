@@ -181,45 +181,27 @@ fn main() {
 /// 目录根本没找到（路径假设错了）、目录在但键名一次没出现（键名或 profile 不对）、
 /// 键名出现了却提取不出值（记录被 snappy 压过 / 值布局与预期不同，看「键后字节」）。
 fn grab(paths: &ConfigPaths) -> i32 {
-    let probes = browser::probe();
-    if probes.is_empty() {
-        println!("没找到任何浏览器的 Local Storage 目录。");
-        println!("可能原因：");
-        println!("  · 浏览器从没访问过 chat.deepseek.com（先登录一次）");
-        println!("  · 浏览器装在 Windows 那边，而 /mnt/c/Users 读不到");
-        println!("  · C 盘不是挂在 /mnt/c（有些 WSL 配置会改）");
+    let hits = browser::scan();
+    if hits.is_empty() {
+        println!("没找到浏览器的 Local Storage 目录（浏览器访问过 chat.deepseek.com 吗？）");
         return 1;
     }
 
     let mut found: Option<(String, String)> = None;
-    for p in &probes {
-        println!("{}  {}", p.browser, p.dir.display());
+    for hit in &hits {
+        println!("{}  {}", hit.browser, hit.dir.display());
         println!(
-            "   文件        .log {} 个 · .ldb {} 个 · 共 {} 字节",
-            p.log_files, p.ldb_files, p.bytes
-        );
-        println!(
-            "   userToken   出现 {} 次 · chat.deepseek.com {}",
-            p.key_hits,
-            if p.origin_hit { "出现" } else { "未出现" }
-        );
-        for sample in &p.samples {
-            println!("   键后字节    {sample}");
-        }
-        match &p.token {
-            Some(token) => {
-                println!(
-                    "   提取结果    成功（{} 字符 · 指纹 {}）",
-                    token.chars().count(),
-                    auth::token_fingerprint(token)
-                );
-                if found.is_none() {
-                    found = Some((p.browser.clone(), token.clone()));
-                }
+            "  userToken {} 次 · 域名 {} · {}",
+            hit.key_hits,
+            if hit.origin { "在" } else { "不在" },
+            match &hit.token {
+                Some(t) => format!("凭证 {} 字符", t.chars().count()),
+                None => "未取到凭证".to_string(),
             }
-            None => println!("   提取结果    没找到"),
+        );
+        if found.is_none() {
+            found = hit.token.as_ref().map(|t| (hit.browser.clone(), t.clone()));
         }
-        println!();
     }
 
     match found {
@@ -227,18 +209,17 @@ fn grab(paths: &ConfigPaths) -> i32 {
             let ua = config::load_config(paths).user_agent;
             match auth::save_token_from_input(paths, &token, &ua) {
                 Ok(_) => {
-                    println!("登录成功！（凭证来自 {who}，已写入 {}）", paths.auth_file.display());
+                    println!("\n登录成功！（来自 {who}）");
                     0
                 }
                 Err(e) => {
-                    println!("凭证已提取，但保存失败：{e}");
+                    println!("\n凭证已取到，保存失败：{e}");
                     1
                 }
             }
         }
         None => {
-            println!("没提取到凭证。把上面的输出发我 —— 看「userToken 出现几次」和");
-            println!("「键后字节」就能确定是键名不对，还是记录被压缩了。");
+            println!("\n没取到凭证。");
             2
         }
     }
@@ -979,9 +960,6 @@ fn open_login_page(core: &mut Core, app: &mut App, rx: &mut Option<Receiver<UiEv
                 return;
             }
         }
-        let _ = tx.send(UiEvent::Notice(
-            "等了 5 分钟还没读到 userToken，可以用 /login token 手动粘贴。".to_string(),
-        ));
         let _ = tx.send(UiEvent::Finished);
     });
 }
