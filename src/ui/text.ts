@@ -41,6 +41,14 @@ export function padTo(text: string, width: number): string {
 	return pad > 0 ? text + " ".repeat(pad) : text;
 }
 
+/** 把毫秒格式化为紧凑时长（0.4s / 3.4s / 1m02s） */
+export function formatDuration(ms: number): string {
+	const clamped = Math.max(0, ms);
+	if (clamped < 60_000) return `${(clamped / 1000).toFixed(1)}s`;
+	const total = Math.round(clamped / 1000);
+	return `${Math.floor(total / 60)}m${String(total % 60).padStart(2, "0")}s`;
+}
+
 /** 按显示宽度截断并追加省略号（保留 ANSI 颜色序列） */
 export function truncateTo(text: string, width: number): string {
 	if (displayWidth(text) <= width) return text;

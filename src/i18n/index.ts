@@ -8,7 +8,7 @@ export type MessageKey = keyof typeof zhMessages;
 
 const zhMessages = {
 	// ── 应用 ──────────────────────────────────────────────
-	"app.tagline": "Pi Agent · 仅 DeepSeek 网页版",
+	"app.tagline": "终端编程助手 · 仅 DeepSeek 网页版",
 	"app.welcome": "欢迎使用 {name}，模型供应商已锁定为 DeepSeek 网页版。",
 	"app.needLogin": "尚未检测到登录凭证，请先执行 /login。",
 	"app.bye": "再见。",
@@ -132,7 +132,7 @@ const zhMessages = {
 } as const;
 
 const enMessages: Record<MessageKey, string> = {
-	"app.tagline": "Pi Agent · DeepSeek Web only",
+	"app.tagline": "Terminal coding agent · DeepSeek Web only",
 	"app.welcome": "Welcome to {name}. The only provider is DeepSeek Web.",
 	"app.needLogin": "No credentials found. Please run /login first.",
 	"app.bye": "Bye.",

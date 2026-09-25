@@ -1,7 +1,7 @@
 // 交互式 REPL —— Agent 风格界面
 //
 // 屏幕布局（自上而下）：
-//   1. 启动头部：ASCII 字形 + 会话/配置目录/凭证信息
+//   1. 启动头部：DSP ASCII 字形 + 会话/配置目录/凭证信息
 //   2. 主输出区：对话流、思考、工具调用（滚动区域 1..rows-2）
 //   3. 输入行：❯ ...（由滚动区域底部承载，滚动区域底部 = rows-2）
 //   4. 提示行：分隔线，输入 / 时变为命令补全
@@ -11,24 +11,26 @@
 import type { App } from "../app.js";
 import { isAuthError } from "../deepseek/provider.js";
 import { describeCall } from "../tools/index.js";
-import { printBanner } from "../ui/banner.js";
+import { APP_FULL_NAME, APP_NAME, printBanner } from "../ui/banner.js";
 import { LineEditor, type EditorKey } from "../ui/line-editor.js";
 import { color, error as printError, info } from "../ui/output.js";
 import { formatHint, printCommandPalette } from "../ui/palette.js";
 import { createStatusBar } from "../ui/statusbar.js";
-import { padTo } from "../ui/text.js";
+import { formatDuration, padTo } from "../ui/text.js";
 import { suggestCommands } from "./command-specs.js";
 import { handleCommand } from "./commands.js";
 import { describeError, runTurn, type TurnIO } from "./loop.js";
 
-/** 状态栏文本：会话 · 模型 · 思考 · 搜索 · 语言（busy 时高亮提示正在生成） */
-export function statusLine(app: App, busy = false): string {
+/** 状态栏文本：会话 · 模型 · 思考 · 搜索 · 语言 */
+// busy 时高亮并显示已耗时（elapsedMs 为 undefined 表示不显示计时）
+export function statusLine(app: App, busy = false, elapsedMs?: number): string {
 	const { t } = app.i18n;
 	const flag = (value: boolean): string =>
 		value ? color.green(t("status.on")) : color.dim(t("status.off"));
 	const marker = busy ? color.yellow("◆") : color.cyan("◆");
+	const timer = elapsedMs != null ? ` ${formatDuration(elapsedMs)}` : "";
 	const title = busy
-		? `${color.yellow(app.activeSession.title)} ${color.yellow(`(${t("status.busy")}…)`)}`
+		? `${color.yellow(app.activeSession.title)} ${color.yellow(`(${t("status.busy")}${timer}…)`)}`
 		: color.cyan(app.activeSession.title);
 	return [
 		`${marker} ${title}`,
@@ -42,6 +44,9 @@ export function statusLine(app: App, busy = false): string {
 /** 构造本轮的渲染回调（Agent 风格：⏺ 工具 / ⎿ 结果 / ✻ 思考） */
 function createTurnIO(app: App): TurnIO {
 	const { t } = app.i18n;
+	const turnStartedAt = Date.now();
+	let toolStartedAt = turnStartedAt;
+
 	return {
 		onThinkStart() {
 			process.stdout.write(`\n  ${color.dim(`✻ ${t("repl.thinkingLabel")}…`)}\n  `);
@@ -59,16 +64,21 @@ function createTurnIO(app: App): TurnIO {
 			process.stdout.write(text);
 		},
 		onToolStart(call) {
+			toolStartedAt = Date.now();
 			info(
 				`\n  ${color.magenta("⏺")} ${color.bold(call.name)}${color.dim(`(${describeCall(call)})`)}`,
 			);
 		},
 		onToolEnd(_call, result) {
 			const detail = result.ok ? color.dim(result.summary) : color.red(result.summary);
-			info(`  ${color.dim("⎿")}  ${detail}`);
+			const cost = color.dim(`(${formatDuration(Date.now() - toolStartedAt)})`);
+			info(`  ${color.dim("⎿")}  ${detail} ${cost}`);
 		},
 		onDone(_finishReason, usage) {
-			if (usage != null) info(`\n  ${color.dim(`· ${usage} ${t("status.tokens")}`)}`);
+			const parts: string[] = [];
+			if (usage != null) parts.push(`${usage} ${t("status.tokens")}`);
+			parts.push(formatDuration(Date.now() - turnStartedAt));
+			info(`\n  ${color.dim(`· ${parts.join("  ·  ")}`)}`);
 		},
 		onNotice(text) {
 			info(`  ${color.yellow(`⚠ ${text}`)}`);
@@ -80,14 +90,14 @@ function createTurnIO(app: App): TurnIO {
 export async function startRepl(app: App): Promise<void> {
 	const { t } = app.i18n;
 
-	// ── 启动头部：ASCII 字形与信息并排 ────────────────────
+	// ── 启动头部：DSP 字形与信息并排 ──────────────────────
 	const token = app.getToken();
 	const label = (text: string): string => color.dim(padTo(text, 12));
 	const stateText = token
 		? color.green(`✓ ${t("ui.credLoaded", { len: token.length })}`)
 		: color.yellow(t("ui.credMissing"));
 	printBanner([
-		color.bold("pi-deepseek-web"),
+		`${color.bold(APP_NAME)}  ${color.dim(`(${APP_FULL_NAME})`)}`,
 		t("app.tagline"),
 		color.dim("─────────────────────────────"),
 		`${label(t("ui.session"))}${color.cyan(app.activeSession.title)}`,
@@ -108,14 +118,30 @@ export async function startRepl(app: App): Promise<void> {
 		if (bar.enabled) bar.set(defaultHint, statusLine(app));
 	};
 
-	// ── 自研行编辑器 ──────────────────────────────────────
+	// ── 忙碌态与实时计时 ──────────────────────────────────
 	let activeAbort: AbortController | null = null;
 	let busy = false;
+	let busyTimer: ReturnType<typeof setInterval> | null = null;
+	let busyStartedAt = 0;
 
-	/** 切换忙碌状态（状态栏高亮） */
+	const stopBusyTimer = (): void => {
+		if (busyTimer !== null) {
+			clearInterval(busyTimer);
+			busyTimer = null;
+		}
+	};
+
+	/** 切换忙碌状态（状态栏高亮 + 每秒刷新已耗时） */
 	const setBusy = (next: boolean): void => {
 		busy = next;
-		bar.set(defaultHint, statusLine(app, busy));
+		stopBusyTimer();
+		if (next) busyStartedAt = Date.now();
+		bar.set(defaultHint, statusLine(app, busy, next ? 0 : undefined));
+		if (next && bar.enabled) {
+			busyTimer = setInterval(() => {
+				bar.set(defaultHint, statusLine(app, true, Date.now() - busyStartedAt));
+			}, 1000);
+		}
 	};
 
 	const showPalette = (): void => {
@@ -129,7 +155,10 @@ export async function startRepl(app: App): Promise<void> {
 	const updateHint = (): void => {
 		const line = editor.prompting ? editor.line : "";
 		if (line.startsWith("/") && !line.includes(" ")) {
-			bar.set(formatHint(suggestCommands(line, app.i18n.lang), app.i18n.lang), statusLine(app));
+			bar.set(
+				formatHint(suggestCommands(line, app.i18n.lang), app.i18n.lang),
+				statusLine(app, busy, busy ? Date.now() - busyStartedAt : undefined),
+			);
 			if (line === "/" && paletteShownFor !== "/") {
 				paletteShownFor = "/";
 				showPalette();
@@ -139,13 +168,13 @@ export async function startRepl(app: App): Promise<void> {
 			return;
 		}
 		paletteShownFor = undefined;
-		bar.set(defaultHint, statusLine(app));
+		bar.set(defaultHint, statusLine(app, busy, busy ? Date.now() - busyStartedAt : undefined));
 	};
 
 	const toggle = (kind: "thinking" | "search"): void => {
 		if (kind === "thinking") app.setThinking(!app.config.thinking);
 		else app.setSearch(!app.config.search);
-		bar.set(defaultHint, statusLine(app));
+		bar.set(defaultHint, statusLine(app, busy, busy ? Date.now() - busyStartedAt : undefined));
 		editor.redraw();
 	};
 
@@ -180,7 +209,7 @@ export async function startRepl(app: App): Promise<void> {
 	// ── 尺寸变化 ──────────────────────────────────────────
 	process.stdout.on("resize", () => {
 		bar.handleResize();
-		bar.set(defaultHint, statusLine(app));
+		bar.set(defaultHint, statusLine(app, busy, busy ? Date.now() - busyStartedAt : undefined));
 		editor.redraw();
 	});
 
@@ -189,6 +218,7 @@ export async function startRepl(app: App): Promise<void> {
 	const cleanup = (): void => {
 		if (cleaned) return;
 		cleaned = true;
+		stopBusyTimer();
 		editor.dispose();
 		bar.dispose();
 	};

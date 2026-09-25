@@ -12,6 +12,8 @@ import {
 } from "node:crypto";
 import { arch, hostname, platform, userInfo } from "node:os";
 
+// 注意：这是加密盐，属于**稳定的密码学常量**，不是品牌字符串。
+// 项目改名为 DSP 时特意保持不变——一旦改动，已保存的凭证将无法解密（需要重新 /login）。
 const APP_SALT = "pi-deepseek-web/v1";
 const KEY_LENGTH = 32;
 const IV_LENGTH = 12;

@@ -1,4 +1,6 @@
 // 命令行参数解析
+import { APP_FULL_NAME, APP_NAME } from "../ui/banner.js";
+
 export interface CliArgs {
 	/** --config-dir / -c 指定的配置目录 */
 	configDir?: string;
@@ -40,19 +42,20 @@ export function parseArgs(argv: string[]): CliArgs {
 
 /** 帮助文本 */
 export function helpText(): string {
+	const cmd = APP_NAME.toLowerCase();
 	return [
-		"pi-deepseek-web —— Pi Agent（仅 DeepSeek 网页版）",
+		`${APP_NAME} (${APP_FULL_NAME}) —— 终端编程助手，仅使用 DeepSeek 网页版`,
 		"",
 		"用法：",
-		"  pi-deepseek-web [--config-dir <path>]",
-		"  pi-deepseek-web /login            # 直接执行命令后退出",
+		`  ${cmd} [--config-dir <path>]`,
+		`  ${cmd} /login            # 直接执行命令后退出`,
 		"",
 		"选项：",
 		"  -c, --config-dir <path>   指定配置目录（默认 ~/.pi/agent，也可用环境变量 PI_CONFIG_DIR）",
 		"  -h, --help                显示本帮助",
 		"",
 		"首次使用：",
-		"  1) pi-deepseek-web /login   在浏览器中登录，自动抓取并加密保存 token",
-		"  2) pi-deepseek-web          进入交互模式开始对话",
+		`  1) ${cmd} /login   在浏览器中登录，自动抓取并加密保存 token`,
+		`  2) ${cmd}          进入交互模式开始对话`,
 	].join("\n");
 }

@@ -1,6 +1,6 @@
-# pi-deepseek-web
+# DSP (deepseek-pi)
 
-融合 [pi](https://github.com/earendil-works/pi)（Pi Agent 终端版）与 [deepseek-reverse-api](https://github.com/Wu-jiyan/deepseek-reverse-api)（DeepSeek 网页端逆向 API）的能力、重写而成的**精简版 Pi Agent**：
+**DSP** —— 融合 [pi](https://github.com/earendil-works/pi)（Pi Agent 终端版）与 [deepseek-reverse-api](https://github.com/Wu-jiyan/deepseek-reverse-api)（DeepSeek 网页端逆向 API）的能力、重写而成的**终端编程助手**：
 
 - **只有一个供应商**：DeepSeek 网页版（`chat.deepseek.com`），启动即用，无需选择。
 - **`/login` 自动抓 token**：拉起可见浏览器 → 用户正常登录 → 自动从 LocalStorage 读取凭证 → 加密落盘，**全程不需要打开 DevTools 复制任何东西**。
@@ -15,7 +15,7 @@
 
 ```text
 Pi-DeepSeek-Web/
-├── package.json                 # 依赖与构建脚本（bin: pi-deepseek-web）
+├── package.json                 # 依赖与构建脚本（name: deepseek-pi，bin: dsp）
 ├── tsconfig.json                # ESM + NodeNext + 严格模式
 ├── README.md
 ├── src/
@@ -132,11 +132,11 @@ npm start
 ### 常用命令
 
 ```bash
-pi-deepseek-web                          # 交互模式
-pi-deepseek-web /login                   # 单命令模式：登录后退出
-pi-deepseek-web --config-dir ./my-conf   # 自定义配置目录
-PI_CONFIG_DIR=./my-conf pi-deepseek-web  # 用环境变量指定配置目录
-pi-deepseek-web --help
+dsp                          # 交互模式
+dsp /login                   # 单命令模式：登录后退出
+dsp --config-dir ./my-conf   # 自定义配置目录
+PI_CONFIG_DIR=./my-conf dsp  # 用环境变量指定配置目录
+dsp --help
 ```
 
 ---
@@ -200,14 +200,14 @@ pi-deepseek-web --help
 ### 界面
 
 ```text
-  ██████╗ ██╗   pi-deepseek-web
-  ██╔══██╗██║   Pi Agent · 仅 DeepSeek 网页版
-  ██████╔╝██║   ─────────────────────────────
-  ██╔═══╝ ██║   会话        新会话
-  ██║     ██║   配置目录    C:\Users\…\.pi\agent
-  ╚═╝     ╚═╝   凭证        ✓ 已加载（token 64 字符）· /status 可校验
+  ██████╗ ███████╗ ██████╗    DSP  (deepseek-pi)
+  ██╔══██╗██╔════╝ ██╔══██╗   终端编程助手 · 仅 DeepSeek 网页版
+  ██║  ██║███████╗ ██████╔╝   ─────────────────────────────
+  ██║  ██║╚════██║ ██╔═══╝    会话        新会话
+  ██████╔╝███████║ ██║        配置目录    C:\Users\…\.pi\agent
+  ╚═════╝ ╚══════╝ ╚═╝        凭证        ✓ 已加载（token 64 字符）· /status 可校验
 
-  直接输入即可对话 · 输入 / 查看全部命令 · /help 查看帮助
+  直接输入即可对话 · 输入 / 查看全部命令 · Ctrl+T 思考 · Ctrl+S 搜索 · Ctrl+C 中断
 
 ❯ 读取 src/index.ts                          ← 自研行编辑器（历史/光标/CJK 宽度）
 
@@ -215,13 +215,13 @@ pi-deepseek-web --help
   这是一个入口文件……
 
   ⏺ read(src/index.ts)                       ← 工具调用
-  ⎿  已读取 src/index.ts                     ← 工具结果
+  ⎿  已读取 src/index.ts (12ms)               ← 工具结果 + 执行耗时
 
-  · 39 tokens
+  · 39 tokens  · 3.4s                        ← 本轮 token 用量 + 总耗时
 
 ❯ /                                          ← 输入 "/" 弹出全部命令面板
 ▸ /session /search /status /system-prompt    ← 提示行（实时补全）
-◆ 新会话 · deepseek-chat · 思考 关 · 搜索 开 · zh   ← 状态栏（固定在最底部）
+◆ 新会话 (生成中 5.2s…) · deepseek-chat · 思考 关 · 搜索 开 · zh  ← 状态栏（固定底部）
 ```
 
 - **底部固定状态栏**：提示行 + 状态栏两行通过终端滚动区域（DECSTBM）钉在屏幕底部，
@@ -233,6 +233,8 @@ pi-deepseek-web --help
   (`ESC[2K`)，支持历史上下翻、Ctrl+A/E/U/K/W、Home/End、中文宽度感知与超长横向滚动。
 - **输入 `/` 显示全部命令**：立刻把命令面板（含中英文说明）打印到输出区；
   继续输入如 `/s` 会实时筛选，提示行显示 `▸ /session /search /status /system-prompt`。
+- **耗时可视化**：工具结果附带执行耗时，每轮结束显示 token 用量与总耗时；
+  生成期间状态栏每秒刷新已耗时（`◆ 新会话 (生成中 5.2s…)`）。
 - **降级**：非 TTY（管道、重定向）或设置环境变量 `PI_UI=plain` 时自动退化为普通逐行输出。
 
 ```powershell
@@ -316,7 +318,7 @@ npm start           # node dist/index.js
 npm run dev         # tsx 直接运行源码
 ```
 
-`package.json` 的 `bin.pi-deepseek-web` 指向 `dist/index.js`，`npm link` 后可直接用 `pi-deepseek-web` 命令。
+`package.json` 的 `bin.dsp` 指向 `dist/index.js`，`npm link` 后可直接用 `dsp` 命令。
 
 ---
 
