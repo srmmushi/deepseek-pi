@@ -91,6 +91,19 @@ pub enum Toggle {
     Search,
 }
 
+/// 需要连按两下才生效的动作。单次按下会有副作用（或者干脆是破坏性的），
+/// 所以第一次只提示、第二次才执行。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoubleAction {
+    /// Esc ×2：停止当前这一轮
+    Stop,
+    /// Ctrl+C ×2：退出程序
+    Quit,
+}
+
+/// 连按两下的有效窗口
+const DOUBLE_WINDOW: std::time::Duration = std::time::Duration::from_millis(2500);
+
 /// 扁排后的一屏行
 struct Row {
     text: String,
@@ -149,6 +162,11 @@ pub struct App {
     /// Ctrl+T / Ctrl+S 的切换请求，交给主循环去改 core.config
     toggle_request: Option<Toggle>,
 
+    /// 连按两下的检测：待确认的动作 + 第一次按下的时刻
+    double: Option<(DoubleAction, Instant)>,
+    /// Esc 按下的请求（第一次只记下来，第二次才由主循环中止本轮）
+    esc_request: bool,
+
     anchors: Vec<(String, usize)>,
     selection: Option<(Pos, Pos)>,
     origin: Option<Pos>,
@@ -186,6 +204,8 @@ impl Default for App {
             copied: None,
             goto: None,
             pending: None,
+            double: None,
+            esc_request: false,
             quit: false,
         }
     }
@@ -421,6 +441,33 @@ impl App {
         self.toggle_request.take()
     }
 
+    /// 取走 Esc 请求
+    pub fn take_esc(&mut self) -> bool {
+        std::mem::take(&mut self.esc_request)
+    }
+
+    /// 连按两下的确认：窗口内的第二次返回 true；第一次只记下时刻。
+    /// 中间按了别的键不会清掉计时 —— 2500ms 的窗口很短，不必那么严格。
+    pub fn double_pressed(&mut self, action: DoubleAction) -> bool {
+        match self.double {
+            Some((pending, at)) if pending == action && at.elapsed() < DOUBLE_WINDOW => {
+                self.double = None;
+                true
+            }
+            _ => {
+                self.double = Some((action, Instant::now()));
+                false
+            }
+        }
+    }
+
+    /// 还在等第二次按键的话，状态栏给出提示（窗口一到自动消失）
+    fn double_pending(&self) -> Option<DoubleAction> {
+        self.double
+            .filter(|(_, at)| at.elapsed() < DOUBLE_WINDOW)
+            .map(|(action, _)| action)
+    }
+
     /// 交给主循环写剪贴板（这里只负责把文本准备好）
     pub fn take_copied(&mut self) -> Option<String> {
         self.copied.take()
@@ -475,9 +522,13 @@ impl App {
                 if self.login_mode {
                     self.cancel_login();
                 } else if self.selection.is_some() {
+                    // 先清选区，这一次不算「想停止」
                     self.selection = None;
+                    self.double = None;
                 } else {
-                    return true;
+                    // 单次 Esc 不再直接退出：只记一个请求，
+                    // 由主循环判断是不是连按两下（连按两下 = 停止本轮）
+                    self.esc_request = true;
                 }
             }
             KeyCode::Enter => {
@@ -920,6 +971,19 @@ impl App {
             return match lang {
                 Lang::Zh => "把 chat.deepseek.com 的 userToken 粘贴进来，回车确认 · Esc 取消".to_string(),
                 Lang::En => "paste the userToken from chat.deepseek.com, Enter to confirm · Esc cancels".to_string(),
+            };
+        }
+        // 连按两下的等待提示：临时占用整行，窗口一过自动消失
+        if let Some(action) = self.double_pending() {
+            let zh = lang == Lang::Zh;
+            return match action {
+                DoubleAction::Stop => {
+                    if zh { "再按一次 Esc 停止本轮" } else { "Esc again to stop" }.to_string()
+                }
+                DoubleAction::Quit => {
+                    if zh { "再按一次 Ctrl+C 退出程序" } else { "Ctrl+C again to quit" }
+                        .to_string()
+                }
             };
         }
         if self.goto.is_some() {

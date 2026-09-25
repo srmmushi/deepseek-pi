@@ -1,15 +1,15 @@
-mod agent;
-mod auth;
-mod browser;
-mod clipboard;
-mod config;
-mod deepseek;
-mod i18n;
-mod prompt;
-mod stream;
-mod sysinfo;
-mod tools;
-mod ui;
+// 源码按职责分了四个目录（api / chat / infra / tui）。目录只负责归类，
+// 下面这些别名把模块重新挂回 crate 根，于是 `crate::config::Lang`、
+// `ui::App` 这类原有写法全部照旧，各个文件里的 use 一句都不用改。
+pub(crate) mod api;
+pub(crate) mod chat;
+pub(crate) mod infra;
+pub(crate) mod tui;
+
+pub(crate) use api::{client as deepseek, stream};
+pub(crate) use chat::{agent, prompt, tools};
+pub(crate) use infra::{auth, browser, clipboard, config};
+pub(crate) use tui::{app as ui, i18n, sysinfo};
 
 use std::io::Stdout;
 use std::path::PathBuf;
@@ -46,9 +46,9 @@ DSP (deepseek-pi) —— 终端编程助手，仅使用 DeepSeek 网页版
   -h, --help                显示本帮助
 
 快捷键
-  Enter 发送          Esc 退出（有选区时先取消选区）
-  Ctrl+C 中断生成     选区存在时改为复制
-  右键 / Ctrl+C      复制选区
+  Enter 发送          Esc×2 停止本轮（单次 Esc 先清选区 / 取消登录）
+  Ctrl+C×2 退出程序   有选区时 Ctrl+C 改为复制
+  右键               复制选区
   Ctrl+T / Ctrl+S    深度思考 / 智能搜索
   Ctrl+O             展开或收起最近一个块
   Ctrl+↑ / Ctrl+↓    历史顶部 / 回到底部        滚轮 / PgUp / PgDn 翻页
@@ -561,12 +561,21 @@ fn event_loop(
                 }
                 let ctrl_c = key.modifiers.contains(KeyModifiers::CONTROL)
                     && matches!(key.code, KeyCode::Char('c'));
-                if ctrl_c && !app.has_selection() {
-                    core.abort();
+                if ctrl_c {
+                    // 有选区时 Ctrl+C 仍然是「复制」；没有选区则连按两下退出程序
+                    if app.has_selection() {
+                        app.on_key(key);
+                    } else if app.double_pressed(ui::DoubleAction::Quit) {
+                        app.quit = true;
+                    }
                     continue;
                 }
                 if app.on_key(key) {
                     app.quit = true;
+                }
+                // Esc 连按两下 = 停止本轮（单次 Esc 只清选区 / 取消登录）
+                if app.take_esc() && app.double_pressed(ui::DoubleAction::Stop) {
+                    core.abort();
                 }
             }
             Event::Mouse(ev) => app.on_mouse(ev),
