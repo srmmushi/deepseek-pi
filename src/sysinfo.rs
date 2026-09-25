@@ -240,10 +240,18 @@ fn prefer_auto(list: &[Browser]) -> Option<usize> {
         .or(if list.is_empty() { None } else { Some(0) })
 }
 
-/// 用指定浏览器打开 URL。全部都是「URL 作为第一个参数」的调用形式。
-pub fn open_url(browser: &Browser, url: &str) -> std::io::Result<()> {
-    Command::new(&browser.path)
-        .arg(url)
+/// 用指定浏览器打开 URL。
+///
+/// `app_window` 为真时走 `--app=<url>`：Edge / Chrome 会起一个没有地址栏
+/// 和标签页的独立窗口，等于给登录页单开一个「登录框」。
+pub fn open_url(browser: &Browser, url: &str, app_window: bool) -> std::io::Result<()> {
+    let mut command = Command::new(&browser.path);
+    if app_window {
+        command.arg(format!("--app={url}"));
+    } else {
+        command.arg(url);
+    }
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

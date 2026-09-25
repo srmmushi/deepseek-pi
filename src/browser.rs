@@ -44,6 +44,9 @@ const PROFILES: &[&str] = &["Default", "Profile 1", "Profile 2", "Profile 3"];
 /// 单个文件最多读这么多：`.ldb` 可能很大，而我们要找的记录通常在后段
 const MAX_BYTES: u64 = 8 * 1024 * 1024;
 
+/// DeepSeek 的 userToken 长度。盲扫可能多带出几个字节，按这个长度截断。
+const TOKEN_LEN: usize = 64;
+
 /// 扫一遍浏览器存储，返回 `(浏览器名, userToken)`。Edge 优先。
 pub fn extract_user_token() -> Option<(String, String)> {
     for (name, dir) in leveldb_dirs() {
@@ -146,7 +149,8 @@ fn read_capped(path: &Path) -> std::io::Result<Vec<u8>> {
 /// 键和值在 LevelDB 的数据块里是紧挨着的（长度前缀在键前面），
 /// 所以找到键之后往后读一串 token 字符就行。
 fn find_token(bytes: &[u8]) -> Option<String> {
-    const KEY: &[u8] = b"userToken";
+    // 用完整的 localStorage 键，避免撞上别处同名的字符串
+    const KEY: &[u8] = b"chat.deepseek.com\0\x01userToken";
     let mut from = 0;
     while let Some(at) = find(&bytes[from..], KEY) {
         let after_key = from + at + KEY.len();
@@ -178,12 +182,13 @@ fn token_at(bytes: &[u8], start: usize) -> Option<String> {
         i += 1;
     }
     let text = std::str::from_utf8(&bytes[begin..i]).ok()?;
-    // userToken 是长串；太短的更可能是键名残留或别的字段
-    if text.len() >= 24 {
-        Some(text.to_string())
-    } else {
-        None
+    // 盲扫的麻烦：值后面紧跟着下一条记录的长度前缀，而这些字节本身
+    // 也可能落在 token 字符集里，于是多带出几个字符、把凭证弄坏。
+    // DeepSeek 的 userToken 是固定 64 字符，按已知长度截断就干净了。
+    if text.len() < 24 {
+        return None;
     }
+    Some(text.chars().take(TOKEN_LEN).collect())
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {

@@ -54,8 +54,13 @@ DSP (deepseek-pi) —— 终端编程助手，仅使用 DeepSeek 网页版
   左键拖动           选择文本        左键单击块头 折叠
 
 命令
-  /help /login /logout /thinking /search /thinking-view /model /lang
-  /status /sessions /session /clear /goto /info /open /quit
+  /help /login /logout /new /session /clear /goto /thinking /search
+  /thinking-view /model /lang /status /info /open /system-prompt /quit
+
+会话
+  /new               新建会话（清空上下文）
+  /session           列出所有历史会话
+  /session <序号>    进入该会话并载入上下文
 
 环境
   /info              系统、架构、构建号（当前那次 git 提交）、主机名；WSL 才显示虚拟机
@@ -202,6 +207,10 @@ struct Core {
     login_stage: u8,
     /// 密码登录第一步填的账号
     login_account: String,
+    /// 本会话累计的 token 用量（状态栏）
+    total_tokens: u64,
+    /// 最近一轮的生成速率（token/s），还没跑过就是 None
+    last_rate: Option<f64>,
 }
 
 impl Core {
@@ -255,8 +264,17 @@ impl Core {
     fn status_text(&self) -> String {
         // 最底下这一行同时承担「当前状态」和「两个开关的按键」：
         // 不用记 Ctrl+T / Ctrl+S 是什么，看一眼最底下就行。
+        // 最底下这行承担三件事：当前状态、两个开关的按键、累计用量。
+        // 本轮用量/耗时仍留在输出区（TurnDone 那一行），这里放累计值。
+        let mut usage = String::new();
+        if self.total_tokens > 0 {
+            usage.push_str(&format!(" · Σ{} tok", self.total_tokens));
+        }
+        if let Some(rate) = self.last_rate {
+            usage.push_str(&format!(" · {rate:.1} tok/s"));
+        }
         format!(
-            "◆ {} · {} · Ctrl+T {} {} · Ctrl+S {} {} · {}",
+            "◆ {} · {} · Ctrl+T {} {} · Ctrl+S {} {} · {}{usage}",
             self.session_title,
             self.config.model,
             self.t("status.thinking"),
@@ -303,6 +321,8 @@ fn run(paths: ConfigPaths, resume: bool) -> anyhow::Result<()> {
         paths,
         login_stage: STAGE_NONE,
         login_account: String::new(),
+        total_tokens: 0,
+        last_rate: None,
     };
 
     let mut app = App::default();
@@ -367,6 +387,18 @@ fn event_loop(
                         let token = token.clone();
                         do_login(core, app, &token);
                     }
+                    // 累计用量：本轮的 token 数与生成速率汇总到状态栏
+                    UiEvent::TurnDone { usage, gen_ms, .. } => {
+                        if let Some(u) = usage {
+                            core.total_tokens += u;
+                            core.last_rate = if *gen_ms > 0 {
+                                Some(*u as f64 * 1000.0 / *gen_ms as f64)
+                            } else {
+                                None
+                            };
+                            app.set_status(core.status_text());
+                        }
+                    }
                     UiEvent::AuthFailed => {
                         // 界面已经提示过了，这里只负责清掉本地凭证
                         core.token = None;
@@ -391,9 +423,8 @@ fn event_loop(
 
         // 复制请求交给主线程做（会 fork 子进程，不适合放在渲染路径里）
         if let Some(text) = app.take_copied() {
-            let len = text.chars().count();
+            // 静默复制：选区本来就还高亮着，不必再往输出区插一行
             clipboard::copy(&text);
-            app.notice_copied(len);
         }
 
         // 交互式登录：App 只负责「要一次输入」，多步流程靠 login_stage 串起来
@@ -591,7 +622,8 @@ fn command(
 
     match cmd.as_str() {
         "/help" => {
-            for line in HELP.lines() {
+            // 只讲界面里的命令；命令行参数（--config-dir 那些）用 `dsp --help` 看
+            for line in HELP.lines().skip_while(|l| !l.starts_with("快捷键")) {
                 app.line(line);
             }
         }
@@ -610,7 +642,7 @@ fn command(
             let list = sysinfo::detect_browsers();
             let in_wsl = sysinfo::wsl_version().is_some();
             match sysinfo::resolve(&list, &core.config.browser) {
-                Some(i) => match sysinfo::open_url(&list[i], &url) {
+                Some(i) => match sysinfo::open_url(&list[i], &url, false) {
                     Ok(()) => app.line_styled(
                         format!(
                             "已用 {} 打开 {url}",
@@ -702,37 +734,53 @@ fn command(
                 None => app.line_styled(format!("  {}", core.t("ui.loginMissing")), ui::warn()),
             }
         }
-        "/sessions" => {
-            let all = Session::list(&core.paths.sessions_dir);
-            if all.is_empty() {
-                app.line_styled("暂无历史会话。", ui::dim());
-            } else {
-                app.line_styled(format!("历史会话（{}）", all.len()), ui::user_style());
-                for (i, s) in all.iter().enumerate() {
-                    app.line(format!(
-                        "  #{:<3}{:<24}{} 条消息",
-                        i + 1,
-                        s.title,
-                        s.messages.len()
-                    ));
-                }
-                app.line_styled("用 /session <序号> 切换。", ui::dim());
-            }
-        }
+        // /session 不带参数列会话，带编号进入该会话并载入上下文
         "/session" => {
             let all = Session::list(&core.paths.sessions_dir);
-            let index: usize = match arg.trim_start_matches('#').parse::<usize>() {
-                Ok(n) if n >= 1 && n <= all.len() => n - 1,
-                _ => {
-                    app.line_styled("用法：/session <序号>（先 /sessions 查看）", ui::dim());
-                    return;
+            if arg.is_empty() {
+                if all.is_empty() {
+                    app.line_styled("暂无历史会话。", ui::dim());
+                } else {
+                    app.line_styled(format!("历史会话（{}）", all.len()), ui::user_style());
+                    for (i, s) in all.iter().enumerate() {
+                        app.line(format!(
+                            "  #{:<3}{:<24}{} 条消息",
+                            i + 1,
+                            s.title,
+                            s.messages.len()
+                        ));
+                    }
+                    app.line_styled("用 /session <序号> 进入该会话并载入上下文。", ui::dim());
                 }
-            };
-            let picked = all[index].clone();
-            core.session_title = picked.title.clone();
-            *core.session.lock().unwrap() = picked;
+            } else {
+                let index: usize = match arg.trim_start_matches('#').parse::<usize>() {
+                    Ok(n) if n >= 1 && n <= all.len() => n - 1,
+                    _ => {
+                        app.line_styled("序号无效，输入 /session 看列表。", ui::warn());
+                        return;
+                    }
+                };
+                let picked = all[index].clone();
+                let count = picked.messages.len();
+                core.session_title = picked.title.clone();
+                *core.session.lock().unwrap() = picked;
+                core.total_tokens = 0;
+                core.last_rate = None;
+                app.set_status(core.status_text());
+                app.line_styled(
+                    format!("已进入 {}（载入 {count} 条上下文）", core.session_title),
+                    ui::ok(),
+                );
+            }
+        }
+        "/new" => {
+            let cwd = core.session.lock().unwrap().cwd.clone();
+            *core.session.lock().unwrap() = Session::new(cwd, "新会话");
+            core.session_title = "新会话".to_string();
+            core.total_tokens = 0;
+            core.last_rate = None;
             app.set_status(core.status_text());
-            app.line_styled(format!("已切换到 {}", core.session_title), ui::ok());
+            app.line_styled("已新建会话。", ui::ok());
         }
         "/goto" => match arg.trim_start_matches('#').parse::<usize>() {
             Ok(n) if n >= 1 => app.goto_index(n - 1),
@@ -819,10 +867,10 @@ fn open_login_page(core: &mut Core, app: &mut App, rx: &mut Option<Receiver<UiEv
     match sysinfo::resolve(&list, &core.config.browser) {
         Some(i) => {
             let shown = sysinfo::describe(&list[i], in_wsl, core.lang);
-            match sysinfo::open_url(&list[i], SIGN_IN_URL) {
+            match sysinfo::open_url(&list[i], SIGN_IN_URL, list[i].label.contains("Edge")) {
+                // Edge 用 --app 起独立窗口，登录页看起来就是个登录框
                 Ok(()) => {
-                    app.line_styled(format!("已用 {shown} 打开 {SIGN_IN_URL}"), ui::ok());
-                    app.line_styled("扫码或账密登录，成功后凭证会自动读回来。", ui::dim());
+                    app.line_styled(format!("已用 {shown} 打开登录页，登录成功后凭证会自动读回来"), ui::ok());
                 }
                 Err(e) => {
                     app.line_styled(format!("打开浏览器失败：{e}"), ui::err());

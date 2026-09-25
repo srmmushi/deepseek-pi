@@ -25,6 +25,28 @@ const BANNER: [&str; 6] = [
 /// 让它贴着字形，而不是像表格一样甩到终端最右边。
 const BANNER_LABEL_COL: usize = 28;
 
+/// 斜杠命令清单，只用于「输入 / 时的实时提示」。
+/// 真正的分发在 main.rs 的 command()，这里只负责让人看见有哪些。
+const COMMANDS: &[&str] = &[
+    "/help",
+    "/login",
+    "/logout",
+    "/new",
+    "/session",
+    "/clear",
+    "/goto",
+    "/thinking",
+    "/search",
+    "/thinking-view",
+    "/model",
+    "/lang",
+    "/status",
+    "/info",
+    "/open",
+    "/system-prompt",
+    "/quit",
+];
+
 // 工具名各给一个颜色，扫一眼就知道模型在干什么
 fn tool_color(name: &str) -> Color {
     match name {
@@ -570,8 +592,16 @@ impl App {
         for row in from.row..=to.row {
             let Some(line) = self.rows.get(row) else { continue };
             let chars: Vec<char> = line.text.chars().collect();
-            let start = if row == from.row { from.col } else { 0 };
-            let end = if row == to.row { to.col.min(chars.len()) } else { chars.len() };
+            let start = if row == from.row {
+                char_col(&line.text, from.col)
+            } else {
+                0
+            };
+            let end = if row == to.row {
+                char_col(&line.text, to.col).min(chars.len())
+            } else {
+                chars.len()
+            };
             if start < end {
                 out.push(chars[start..end].iter().collect::<String>());
             }
@@ -581,11 +611,6 @@ impl App {
         } else {
             Some(out.join("\n").trim_end().to_string())
         }
-    }
-
-    /// 复制完成后由主循环回一句提示
-    pub fn notice_copied(&mut self, chars: usize) {
-        self.line_styled(format!("已复制 {chars} 个字符到剪贴板"), dim());
     }
 
     fn insert(&mut self, c: char) {
@@ -691,6 +716,31 @@ impl App {
         } else {
             ("❯ ", Style::default().fg(Color::Cyan))
         };
+        // 输入以 / 开头时，在输入行右侧实时列出匹配的命令：
+        // 敲 / 看全部，敲 /s 只剩 /s 开头的。
+        if self.input.starts_with('/') && !self.login_mode {
+            let want = self.input.to_ascii_lowercase();
+            let matched: Vec<&str> = COMMANDS
+                .iter()
+                .filter(|c| c.starts_with(&want))
+                .copied()
+                .collect();
+            let used = prompt.chars().count() + self.input.chars().count();
+            let avail = (input_area.width as usize).saturating_sub(used + 2);
+            if !matched.is_empty() && avail > 6 {
+                let shown: String = matched.join(" ").chars().take(avail).collect();
+                let pad = (input_area.width as usize)
+                    .saturating_sub(used + shown.chars().count() + 1);
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        format!("{}{}", " ".repeat(pad), shown),
+                        dim(),
+                    ))),
+                    input_area,
+                );
+            }
+        }
+
         // token / 密码掩码显示，屏幕上看不到原文
         let shown = if self.login_mask {
             "*".repeat(self.input.chars().count())
@@ -723,6 +773,42 @@ impl App {
         }
     }
 
+    /// 字符的显示宽度（CJK / 全角算 2 列）
+    fn char_width(c: char) -> usize {
+        let cp = c as u32;
+        let wide = (0x1100..=0x115F).contains(&cp)
+            || (0x2E80..=0xA4CF).contains(&cp)
+            || (0xAC00..=0xD7A3).contains(&cp)
+            || (0xF900..=0xFAFF).contains(&cp)
+            || (0xFE30..=0xFE6F).contains(&cp)
+            || (0xFF00..=0xFF60).contains(&cp)
+            || (0xFFE0..=0xFFE6).contains(&cp)
+            || (0x1F300..=0x1FAFF).contains(&cp);
+        if wide {
+            2
+        } else {
+            1
+        }
+    }
+}
+
+/// 显示列 → 字符下标。
+///
+/// 鼠标事件给的是「第几列」，而行的内容是按「第几个字符」切片的。
+/// 中文一个字占两列，直接拿列号当下标用，整行就会往右偏 ——
+/// 这正是选中内容看起来偏移的原因。
+fn char_col(text: &str, col: usize) -> usize {
+    let mut width = 0;
+    for (i, c) in text.chars().enumerate() {
+        if width >= col {
+            return i;
+        }
+        width += App::char_width(c);
+    }
+    text.chars().count()
+}
+
+impl App {
     fn render_row(&self, row: &Row, index: usize, width: usize) -> Line<'static> {
         let mut spans = self.selection_spans(row, index);
         if let Some((right, style)) = &row.right {
@@ -752,8 +838,16 @@ impl App {
             return plain();
         }
         let chars: Vec<char> = row.text.chars().collect();
-        let s = if index == from.row { from.col.min(chars.len()) } else { 0 };
-        let e = if index == to.row { to.col.min(chars.len()) } else { chars.len() };
+        let s = if index == from.row {
+            char_col(&row.text, from.col)
+        } else {
+            0
+        };
+        let e = if index == to.row {
+            char_col(&row.text, to.col)
+        } else {
+            chars.len()
+        };
         let head: String = chars[..s].iter().collect();
         let mid: String = chars[s..e].iter().collect();
         let tail: String = chars[e..].iter().collect();
