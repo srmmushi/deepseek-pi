@@ -1,0 +1,802 @@
+//! DeepSeek 网页版协议层：PoW 求解 + REST 客户端 + completion 生命周期
+//!
+//! 三个子模块合在一个文件里，因为它们共享同一套错误类型与配置。
+
+use anyhow::{anyhow, bail, Context, Result};
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine as _;
+use reqwest::blocking::Client as HttpClient;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use serde_json::{json, Value};
+use std::io::Read;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+use crate::config::AppConfig;
+use crate::stream::{is_retryable, SseParser, StreamEvent};
+
+/// DeepSeek 站点源
+pub const ORIGIN: &str = "https://chat.deepseek.com";
+
+const EP_SESSION_CREATE: &str = "/chat_session/create";
+const EP_SESSION_DELETE: &str = "/chat_session/delete";
+const EP_POW_CHALLENGE: &str = "/chat/create_pow_challenge";
+const EP_COMPLETION: &str = "/chat/completion";
+const EP_STOP_STREAM: &str = "/chat/stop_stream";
+
+/// PoW target_path
+pub const POW_TARGET_COMPLETION: &str = "/api/v0/chat/completion";
+
+/// 统一错误类型
+#[derive(Debug)]
+pub enum DsError {
+    /// 业务错误（信封里的 code / biz_code）
+    Api { code: i64, message: String },
+    /// HTTP 层错误
+    Http { status: u16, body: String },
+    /// CloudFront WAF 拦截
+    Waf,
+    /// 上游 hint（限流等）
+    Hint(String, bool),
+    /// 其它
+    Other(String),
+}
+
+impl std::fmt::Display for DsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DsError::Api { code, message } => write!(f, "接口错误 {code}: {message}"),
+            DsError::Http { status, body } => write!(f, "HTTP {status}: {body}"),
+            DsError::Waf => write!(f, "WAF challenge"),
+            DsError::Hint(msg, _) => write!(f, "{msg}"),
+            DsError::Other(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+impl std::error::Error for DsError {}
+
+impl DsError {
+    /// 凭证失效
+    pub fn is_auth(&self) -> bool {
+        matches!(self, DsError::Api { code: 40003, .. })
+    }
+    /// 限流
+    pub fn is_rate_limit(&self) -> bool {
+        match self {
+            DsError::Hint(_, overloaded) => *overloaded,
+            DsError::Api { code, .. } => *code == 1001 || *code == 1201,
+            _ => false,
+        }
+    }
+    pub fn is_retryable(&self) -> bool {
+        is_retryable(self)
+    }
+}
+
+/// ── PoW 挑战 ────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct Challenge {
+    pub algorithm: String,
+    pub challenge: String,
+    pub salt: String,
+    pub signature: String,
+    pub difficulty: i64,
+    pub expire_at: i64,
+    pub target_path: String,
+}
+
+/// base64(JSON) 后的 PoW 头
+pub fn encode_pow_header(challenge: &Challenge, answer: i64) -> String {
+    let payload = json!({
+        "algorithm": challenge.algorithm,
+        "challenge": challenge.challenge,
+        "salt": challenge.salt,
+        "answer": answer,
+        "signature": challenge.signature,
+        "target_path": challenge.target_path,
+    });
+    B64.encode(payload.to_string())
+}
+
+/// ── PoW 求解器（wasmi 执行官方 sha3 WASM）────────────────────
+
+/// PoW 求解器：持有已实例化的 WASM 运行时
+pub struct PowSolver {
+    store: wasmi::Store<()>,
+    instance: wasmi::Instance,
+    memory: wasmi::Memory,
+    malloc: String,
+    add_to_stack: String,
+    solve: String,
+}
+
+impl PowSolver {
+    /// 从 WASM 字节构建求解器
+    pub fn new(wasm: &[u8]) -> Result<Self> {
+        let engine = wasmi::Engine::default();
+        let module = wasmi::Module::new(&engine, wasm).context("解析 PoW WASM 失败")?;
+        let mut store = wasmi::Store::new(&engine, ());
+        // DeepSeek 的 sha3 wasm 通常没有 import；有的话给出明确提示
+        let linker = wasmi::Linker::new(&engine);
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .context("实例化 PoW WASM 失败（可能存在未提供的 import）")?
+            .start(&mut store)
+            .context("启动 PoW WASM 失败")?;
+
+        let memory = instance
+            .get_memory(&store, "memory")
+            .ok_or_else(|| anyhow!("PoW WASM 未导出 memory"))?;
+
+        // 收集函数型导出名，用于「按名探测 + 唯一候选兜底」
+        let mut funcs: Vec<String> = Vec::new();
+        for export in module.exports() {
+            if matches!(export.ty(), wasmi::ExternType::Func(_)) {
+                funcs.push(export.name().to_string());
+            }
+        }
+
+        let add_to_stack = funcs
+            .iter()
+            .find(|n| n.as_str() == "__wbindgen_add_to_stack_pointer")
+            .or_else(|| funcs.iter().find(|n| n.contains("add_to_stack")))
+            .cloned()
+            .ok_or_else(|| anyhow!("未找到 __wbindgen_add_to_stack_pointer 导出"))?;
+
+        let malloc = funcs
+            .iter()
+            .find(|n| n.as_str() == "__wbindgen_malloc")
+            .or_else(|| funcs.iter().find(|n| n.starts_with("__wbindgen_export_")))
+            .or_else(|| funcs.iter().find(|n| n.contains("malloc")))
+            .cloned()
+            .ok_or_else(|| anyhow!("未找到内存分配器导出（__wbindgen_malloc）"))?;
+
+        let mut solve = funcs
+            .iter()
+            .find(|n| n.as_str() == "wasm_solve")
+            .cloned();
+        if solve.is_none() {
+            // 兜底：排除已知符号后只剩一个函数，就认它
+            let known = [add_to_stack.as_str(), malloc.as_str(), "memory"];
+            let rest: Vec<&String> = funcs.iter().filter(|n| !known.contains(&n.as_str())).collect();
+            if rest.len() == 1 {
+                solve = Some(rest[0].clone());
+            }
+        }
+        let solve = solve.ok_or_else(|| anyhow!("未找到 wasm_solve 导出"))?;
+
+        Ok(Self {
+            store,
+            instance,
+            memory,
+            malloc,
+            add_to_stack,
+            solve,
+        })
+    }
+
+    /// 在 WASM 内存里写入字节，返回 (ptr, len)
+    fn write_bytes(&mut self, data: &[u8]) -> Result<(i32, i32)> {
+        let malloc = self
+            .instance
+            .get_func(&self.store, &self.malloc)
+            .ok_or_else(|| anyhow!("缺少分配器"))?;
+        let mut results = [wasmi::Val::I32(0)];
+        malloc
+            .call(
+                &mut self.store,
+                &[wasmi::Val::I32(data.len() as i32), wasmi::Val::I32(1)],
+                &mut results,
+            )
+            .context("调用分配器失败")?;
+        let ptr = match results[0] {
+            wasmi::Val::I32(v) => v,
+            _ => bail!("分配器返回值异常"),
+        };
+        let mem = self.memory.data_mut(&mut self.store);
+        let start = ptr as usize;
+        let end = start + data.len();
+        if end > mem.len() {
+            bail!("WASM 内存不足（需要 {end} 字节，实际 {}）", mem.len());
+        }
+        mem[start..end].copy_from_slice(data);
+        Ok((ptr, data.len() as i32))
+    }
+
+    /// 调用一个函数，参数类型按实际签名动态适配
+    fn call_dynamic(&mut self, name: &str, ints: &[i64]) -> Result<()> {
+        let func = self
+            .instance
+            .get_func(&self.store, name)
+            .ok_or_else(|| anyhow!("缺少函数导出：{name}"))?;
+        let ty = func.ty(&self.store);
+        let params_ty = ty.params().to_vec();
+        let results_ty = ty.results().to_vec();
+
+        let mut params = Vec::with_capacity(params_ty.len());
+        for (i, t) in params_ty.iter().enumerate() {
+            let raw = *ints.get(i).unwrap_or(&0);
+            // wasmi 0.36 起 ValType 位于 wasmi::core，且 F32/F64 是包装类型
+            params.push(match t {
+                wasmi::core::ValType::I32 => wasmi::Val::I32(raw as i32),
+                wasmi::core::ValType::I64 => wasmi::Val::I64(raw),
+                wasmi::core::ValType::F32 => {
+                    wasmi::Val::F32(wasmi::core::F32::from(raw as f32))
+                }
+                wasmi::core::ValType::F64 => {
+                    wasmi::Val::F64(wasmi::core::F64::from(raw as f64))
+                }
+                _ => wasmi::Val::I32(raw as i32),
+            });
+        }
+        let mut results = vec![wasmi::Val::I32(0); results_ty.len()];
+        func.call(&mut self.store, &params, &mut results)
+            .with_context(|| format!("调用 {name} 失败"))?;
+        Ok(())
+    }
+
+    /// 求解挑战，返回 answer
+    pub fn solve(&mut self, challenge: &Challenge) -> Result<i64> {
+        if challenge.algorithm != "DeepSeekHashV1" {
+            bail!("不支持的 PoW 算法：{}", challenge.algorithm);
+        }
+        // 前缀是 salt_expireAt_，取不到 expire_at 会导致永远无解
+        let prefix = format!("{}_{}_", challenge.salt, challenge.expire_at);
+
+        // 12/16 字节的返回区（wasm-bindgen 惯例：i32 status + f64 value）
+        let add = self
+            .instance
+            .get_func(&self.store, &self.add_to_stack)
+            .ok_or_else(|| anyhow!("缺少栈指针导出"))?;
+        let mut res = [wasmi::Val::I32(0)];
+        add.call(
+            &mut self.store,
+            &[wasmi::Val::I32(-16)],
+            &mut res,
+        )
+        .context("调整 WASM 栈指针失败")?;
+        let retptr = match res[0] {
+            wasmi::Val::I32(v) => v,
+            _ => bail!("栈指针返回值异常"),
+        };
+
+        let (cp, cl) = self.write_bytes(challenge.challenge.as_bytes())?;
+        let (pp, pl) = self.write_bytes(prefix.as_bytes())?;
+
+        let solve_name = self.solve.clone();
+        self.call_dynamic(
+            &solve_name,
+            &[
+                retptr as i64,
+                cp as i64,
+                cl as i64,
+                pp as i64,
+                pl as i64,
+                challenge.difficulty,
+            ],
+        )?;
+
+        let mem = self.memory.data(&self.store);
+        let base = retptr as usize;
+        if base + 16 > mem.len() {
+            bail!("返回区越界");
+        }
+        let status = i32::from_le_bytes(mem[base..base + 4].try_into().unwrap());
+        let value = f64::from_le_bytes(mem[base + 8..base + 16].try_into().unwrap());
+        if status == 0 {
+            bail!("WASM 未求出解（difficulty={}）", challenge.difficulty);
+        }
+        Ok(value as i64)
+    }
+}
+
+/// 下载 / 复用 PoW WASM（进程内缓存）
+pub fn load_pow_solver(url: &str, user_agent: &str, proxy: &str) -> Result<PowSolver> {
+    let mut builder = HttpClient::builder()
+        .user_agent(user_agent)
+        .timeout(Duration::from_secs(60));
+    if !proxy.is_empty() {
+        builder = builder.proxy(reqwest::Proxy::all(proxy)?);
+    }
+    let http = builder.build()?;
+    let res = http
+        .get(url)
+        .header("Accept", "*/*")
+        .send()
+        .with_context(|| format!("下载 PoW WASM 失败：{url}"))?;
+    if !res.status().is_success() {
+        bail!("下载 PoW WASM 失败：HTTP {}", res.status().as_u16());
+    }
+    let bytes = res.bytes()?;
+    PowSolver::new(&bytes)
+}
+
+// ── REST 客户端 ─────────────────────────────────────────────
+
+/// 由 UA 推导 sec-ch-ua 系列头，让请求更接近真实浏览器
+fn client_hints(ua: &str) -> Vec<(&'static str, String)> {
+    let chrome = extract_version(ua, "Chrome/");
+    let Some(chrome) = chrome else {
+        return vec![];
+    };
+    let edge = extract_version(ua, "Edg/");
+    let mut brands = match edge {
+        Some(edge_ver) => vec![
+            format!("\"Microsoft Edge\";v=\"{edge_ver}\""),
+            format!("\"Chromium\";v=\"{chrome}\""),
+        ],
+        None => vec![
+            format!("\"Google Chrome\";v=\"{chrome}\""),
+            format!("\"Chromium\";v=\"{chrome}\""),
+        ],
+    };
+    brands.push("\"Not(A:Brand\";v=\"24\"".to_string());
+    let platform = if ua.contains("Windows") {
+        "Windows"
+    } else if ua.contains("Mac OS X") {
+        "macOS"
+    } else {
+        "Linux"
+    };
+    vec![
+        ("sec-ch-ua", brands.join(", ")),
+        ("sec-ch-ua-mobile", "?0".to_string()),
+        ("sec-ch-ua-platform", format!("\"{platform}\"")),
+        ("sec-fetch-dest", "empty".to_string()),
+        ("sec-fetch-mode", "cors".to_string()),
+        ("sec-fetch-site", "same-origin".to_string()),
+    ]
+}
+
+fn extract_version(ua: &str, marker: &str) -> Option<String> {
+    let start = ua.find(marker)? + marker.len();
+    let digits: String = ua[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        None
+    } else {
+        Some(digits)
+    }
+}
+
+/// DeepSeek 网页版客户端
+pub struct DeepSeekClient {
+    config: AppConfig,
+    http: HttpClient,
+    last_request_at: Mutex<Option<Instant>>,
+}
+
+impl DeepSeekClient {
+    pub fn new(config: &AppConfig) -> Result<Self> {
+        let mut builder = HttpClient::builder()
+            .timeout(Duration::from_secs(300))
+            .danger_accept_invalid_certs(false);
+        if !config.proxy.is_empty() {
+            builder = builder.proxy(reqwest::Proxy::all(&config.proxy)?);
+        }
+        Ok(Self {
+            config: config.clone(),
+            http: builder.build()?,
+            last_request_at: Mutex::new(None),
+        })
+    }
+
+    /// 伪造浏览器请求头
+    fn build_headers(&self, token: Option<&str>, pow: Option<&str>, has_body: bool) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        let mut put = |k: &str, v: &str| {
+            if let (Ok(name), Ok(value)) = (
+                HeaderName::from_bytes(k.as_bytes()),
+                HeaderValue::from_str(v),
+            ) {
+                headers.insert(name, value);
+            }
+        };
+        put("User-Agent", &self.config.user_agent);
+        put("Accept", "*/*");
+        put(
+            "Accept-Language",
+            &format!("{},en;q=0.9", self.config.client_locale.replace('_', "-")),
+        );
+        put("Origin", ORIGIN);
+        put("Referer", &format!("{ORIGIN}/"));
+        for (k, v) in client_hints(&self.config.user_agent) {
+            put(k, &v);
+        }
+        if !self.config.client_version.is_empty() {
+            put("x-client-version", &self.config.client_version);
+        }
+        if !self.config.client_platform.is_empty() {
+            put("x-client-platform", &self.config.client_platform);
+        }
+        if !self.config.client_locale.is_empty() {
+            put("x-client-locale", &self.config.client_locale);
+        }
+        if has_body {
+            put("Content-Type", "application/json");
+        }
+        if let Some(t) = token {
+            put("Authorization", &format!("Bearer {t}"));
+        }
+        if let Some(p) = pow {
+            put("x-ds-pow-response", p);
+        }
+        headers
+    }
+
+    /// 保守限速
+    fn throttle(&self) {
+        let gap = self.config.request_interval_ms;
+        if gap == 0 {
+            return;
+        }
+        let mut guard = self.last_request_at.lock().unwrap();
+        if let Some(last) = *guard {
+            let elapsed = last.elapsed().as_millis() as u64;
+            if elapsed < gap {
+                std::thread::sleep(Duration::from_millis(gap - elapsed));
+            }
+        }
+        *guard = Some(Instant::now());
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("{}{}", self.config.api_base, path)
+    }
+
+    /// POST JSON 并解开信封，返回 biz_data
+    fn post_json(&self, path: &str, token: &str, body: &Value) -> Result<Value, DsError> {
+        self.throttle();
+        let res = self
+            .http
+            .post(self.url(path))
+            .headers(self.build_headers(Some(token), None, true))
+            .body(body.to_string())
+            .send()
+            .map_err(|e| DsError::Other(format!("请求失败：{e}")))?;
+
+        let status = res.status();
+        if status.as_u16() == 202 {
+            return Err(DsError::Waf);
+        }
+        let text = res
+            .text()
+            .map_err(|e| DsError::Other(format!("读取响应失败：{e}")))?;
+        if !status.is_success() {
+            return Err(DsError::Http {
+                status: status.as_u16(),
+                body: text.chars().take(300).collect(),
+            });
+        }
+        let env: Value = serde_json::from_str(&text)
+            .map_err(|e| DsError::Other(format!("响应不是合法 JSON：{e}")))?;
+        let code = env.get("code").and_then(|v| v.as_i64()).unwrap_or(0);
+        if code != 0 {
+            return Err(DsError::Api {
+                code,
+                message: env
+                    .get("msg")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown error")
+                    .to_string(),
+            });
+        }
+        let data = env.get("data").filter(|d| !d.is_null()).ok_or(DsError::Api {
+            code: -1,
+            message: "响应缺少 data 字段".to_string(),
+        })?;
+        let biz_code = data.get("biz_code").and_then(|v| v.as_i64()).unwrap_or(0);
+        if biz_code != 0 {
+            return Err(DsError::Api {
+                code: biz_code,
+                message: data
+                    .get("biz_msg")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown biz error")
+                    .to_string(),
+            });
+        }
+        Ok(data.get("biz_data").cloned().unwrap_or(Value::Null))
+    }
+
+    /// 创建会话
+    pub fn create_session(&self, token: &str) -> Result<String, DsError> {
+        let data = self.post_json(EP_SESSION_CREATE, token, &json!({}))?;
+        data.get("chat_session")
+            .and_then(|s| s.get("id"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or(DsError::Api {
+                code: -1,
+                message: "创建会话失败：缺少 chat_session.id".to_string(),
+            })
+    }
+
+    /// 删除会话（失败静默）
+    pub fn delete_session(&self, token: &str, session_id: &str) {
+        let _ = self.post_json(
+            EP_SESSION_DELETE,
+            token,
+            &json!({ "chat_session_id": session_id }),
+        );
+    }
+
+    /// 请求 PoW 挑战
+    pub fn create_pow_challenge(
+        &self,
+        token: &str,
+        target_path: &str,
+    ) -> Result<Challenge, DsError> {
+        let data = self.post_json(
+            EP_POW_CHALLENGE,
+            token,
+            &json!({ "target_path": target_path }),
+        )?;
+        let raw = data.get("challenge").ok_or(DsError::Api {
+            code: -1,
+            message: "获取 PoW 挑战失败".to_string(),
+        })?;
+        let field = |k: &str| raw.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        let num = |k: &str| raw.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
+        Ok(Challenge {
+            algorithm: field("algorithm"),
+            challenge: field("challenge"),
+            salt: field("salt"),
+            signature: field("signature"),
+            difficulty: num("difficulty"),
+            // 关键：前缀依赖 expire_at，取不到会退化成 salt_0_
+            expire_at: num("expire_at"),
+            target_path: {
+                let t = field("target_path");
+                if t.is_empty() {
+                    target_path.to_string()
+                } else {
+                    t
+                }
+            },
+        })
+    }
+
+    /// 发起 completion，返回可读的响应体
+    pub fn completion(
+        &self,
+        token: &str,
+        pow_header: &str,
+        payload: &Value,
+    ) -> Result<reqwest::blocking::Response, DsError> {
+        self.throttle();
+        let res = self
+            .http
+            .post(self.url(EP_COMPLETION))
+            .headers(self.build_headers(Some(token), Some(pow_header), true))
+            .body(payload.to_string())
+            .send()
+            .map_err(|e| DsError::Other(format!("请求失败：{e}")))?;
+        let status = res.status();
+        if status.as_u16() == 202 {
+            return Err(DsError::Waf);
+        }
+        if !status.is_success() {
+            let text = res.text().unwrap_or_default();
+            return Err(DsError::Http {
+                status: status.as_u16(),
+                body: text.chars().take(300).collect(),
+            });
+        }
+        Ok(res)
+    }
+
+    /// 中断流式输出（失败不致命）
+    pub fn stop_stream(&self, token: &str, session_id: &str, message_id: u64) {
+        let _ = self.post_json(
+            EP_STOP_STREAM,
+            token,
+            &json!({ "chat_session_id": session_id, "message_id": message_id }),
+        );
+    }
+}
+
+// ── completion 编排 ─────────────────────────────────────────
+
+/// 网页会话句柄（复用模式）
+#[derive(Debug, Clone, Default)]
+pub struct WebSessionHandle {
+    pub session_id: Option<String>,
+    pub parent_message_id: Option<u64>,
+}
+
+/// 单次流式对话：逐事件回调。回调返回 false 表示请求中断。
+///
+/// 参数逐个传入（而不是打包成结构体），这样重试循环可以每轮重新借用 `&mut`。
+#[allow(clippy::too_many_arguments)]
+pub fn stream_chat(
+    client: &DeepSeekClient,
+    solver: &mut PowSolver,
+    token: &str,
+    prompt: &str,
+    model_type: &str,
+    thinking_enabled: bool,
+    search_enabled: bool,
+    handle: Option<&mut WebSessionHandle>,
+    on_event: &mut dyn FnMut(StreamEvent) -> bool,
+) -> Result<(), DsError> {
+    let owned_session = handle.is_none();
+    let mut handle = handle;
+    let already_bound = handle
+        .as_ref()
+        .and_then(|h| h.session_id.clone())
+        .is_some();
+
+    let session_id = match handle.as_ref().and_then(|h| h.session_id.clone()) {
+        Some(id) => id,
+        None => {
+            let id = client.create_session(token)?;
+            if let Some(h) = handle.as_mut() {
+                h.session_id = Some(id.clone());
+            }
+            id
+        }
+    };
+
+    let mut message_id: Option<u64> = None;
+    let mut finished = false;
+    let mut saw_event = false;
+    let mut raw_head = String::new();
+
+    let result = (|| -> Result<(), DsError> {
+        let challenge = client.create_pow_challenge(token, POW_TARGET_COMPLETION)?;
+        let answer = solver
+            .solve(&challenge)
+            .map_err(|e| DsError::Other(format!("PoW 求解失败：{e}")))?;
+        let pow_header = encode_pow_header(&challenge, answer);
+
+        let payload = json!({
+            "chat_session_id": session_id,
+            "parent_message_id": if already_bound {
+                handle.as_ref().and_then(|h| h.parent_message_id)
+            } else {
+                None
+            },
+            "model_type": model_type,
+            "prompt": prompt.to_string(),
+            "ref_file_ids": [],
+            "thinking_enabled": thinking_enabled,
+            "search_enabled": search_enabled,
+            "preempt": false,
+        });
+
+        let mut res = client.completion(token, &pow_header, &payload)?;
+        let mut parser = SseParser::new();
+        let mut buf = [0u8; 8192];
+
+        loop {
+            let n = res
+                .read(&mut buf)
+                .map_err(|e| DsError::Other(format!("读取流失败：{e}")))?;
+            if n == 0 {
+                break;
+            }
+            let text = String::from_utf8_lossy(&buf[..n]).to_string();
+            if message_id.is_none() && raw_head.len() < 4096 {
+                raw_head.push_str(&text);
+                message_id = crate::stream::extract_message_id(&raw_head);
+            }
+            let events = parser
+                .push(&text)
+                .map_err(|e| DsError::Hint(e.message, e.overloaded))?;
+            if !events.is_empty() {
+                saw_event = true;
+            }
+            for evt in events {
+                if !on_event(evt) {
+                    break;
+                }
+            }
+            if parser.done() {
+                finished = true;
+                break;
+            }
+        }
+
+        if !finished {
+            let tail = parser
+                .flush()
+                .map_err(|e| DsError::Hint(e.message, e.overloaded))?;
+            for evt in tail {
+                if matches!(evt, StreamEvent::Done { .. }) {
+                    finished = true;
+                }
+                saw_event = true;
+                if !on_event(evt) {
+                    break;
+                }
+            }
+        }
+
+        if !saw_event {
+            return Err(DsError::Other(format!(
+                "无法解析的响应：{}",
+                raw_head.chars().take(200).collect::<String>()
+            )));
+        }
+        Ok(())
+    })();
+
+    // 收尾：回写 message id、必要时中断、一次性会话删除
+    if let Some(h) = handle.as_mut() {
+        if let Some(id) = message_id {
+            h.parent_message_id = Some(id);
+        }
+    }
+    if !finished {
+        if let Some(id) = message_id {
+            client.stop_stream(token, &session_id, id);
+        }
+    }
+    if owned_session {
+        client.delete_session(token, &session_id);
+    } else if !already_bound && message_id.is_none() {
+        client.delete_session(token, &session_id);
+        if let Some(h) = handle.as_mut() {
+            h.session_id = None;
+        }
+    }
+
+    result
+}
+
+/// 带退避重试的流式对话（仅在尚未产出任何事件时重试）
+#[allow(clippy::too_many_arguments)]
+pub fn stream_chat_with_retry(
+    client: &DeepSeekClient,
+    solver: &mut PowSolver,
+    token: &str,
+    prompt: &str,
+    model_type: &str,
+    thinking_enabled: bool,
+    search_enabled: bool,
+    handle: Option<&mut WebSessionHandle>,
+    on_event: &mut dyn FnMut(StreamEvent) -> bool,
+    max_attempts: usize,
+) -> Result<(), DsError> {
+    let mut attempt = 0;
+    let mut handle = handle;
+    loop {
+        attempt += 1;
+        let mut yielded = false;
+        {
+            let mut wrapper = |evt: StreamEvent| {
+                yielded = true;
+                on_event(evt)
+            };
+            let result = stream_chat(
+                client,
+                solver,
+                token,
+                prompt,
+                model_type,
+                thinking_enabled,
+                search_enabled,
+                handle.as_deref_mut(),
+                &mut wrapper,
+            );
+            match result {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    if matches!(e, DsError::Waf)
+                        || yielded
+                        || !e.is_retryable()
+                        || attempt >= max_attempts
+                    {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        let backoff = 1000u64 * 2u64.pow((attempt - 1) as u32);
+        std::thread::sleep(Duration::from_millis(backoff));
+    }
+}

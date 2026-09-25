@@ -3,3 +3,7 @@ dist/
 *.log
 .DS_Store
 .env
+
+# Rust
+rust/target/
+**/*.rs.bk
