@@ -48,6 +48,12 @@ export interface LineEditorOptions {
 	onIdleKey?: (key: EditorKey) => void;
 	/** 鼠标事件回调（需调用方先开启鼠标跟踪）；输入中与输出中都会触发 */
 	onMouse?: (event: MouseEvent) => void;
+	/**
+	 * 提交后是否由编辑器自行换行。
+	 * 置 false 时编辑器不动这一行，交由调用方接管 —— 例如把它改写为
+	 * 带样式的用户消息回显（同时进入块渲染器缓冲区，保证重绘保真）。
+	 */
+	keepInputLine?: boolean;
 }
 
 const MAX_HISTORY = 200;
@@ -166,7 +172,7 @@ export class LineEditor {
 	private submit(line: string): void {
 		// 必须用 \r\n：raw 模式下 \n 不回列，直接用 \n 会把输入行的列偏移
 		// 带进后续输出，导致输出整体右移并最终折行覆盖状态栏。
-		process.stdout.write("\r\n");
+		if (!this.options.keepInputLine) process.stdout.write("\r\n");
 		this.active = false;
 		if (line.trim()) {
 			this.history.push(line);
@@ -324,9 +330,13 @@ export class LineEditor {
 		this.render();
 	}
 
-	/** 非 TTY 下回显输入行 */
-	private emitPiped(line: string): void {
-		process.stdout.write(`${this.options.prompt}${line}\n`);
+	/**
+	 * 非 TTY 下的输入回显。
+	 * 刻意留空：回显统一由调用方负责（TTY 与管道两条路径保持一致，
+	 * 且回显内容要进入块渲染器缓冲区，否则整体重绘会把它擦掉）。
+	 */
+	private emitPiped(_line: string): void {
+		// no-op
 	}
 
 	/** 非 TTY：按行读取（支持一次投喂多行、也支持流提前结束） */

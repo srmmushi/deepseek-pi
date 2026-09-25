@@ -36,6 +36,11 @@ export function setOutputAnchor(fn: (() => void) | null): void {
 	outputAnchor = fn;
 }
 
+/** 立即执行一次光标归位（块渲染器整体重绘后调用，把光标交还输入行） */
+export function anchorNow(): void {
+	outputAnchor?.();
+}
+
 /** 普通信息输出（stdout）—— TTY 下写前归位光标，写后换行 */
 export function info(message = ""): void {
 	if (!isTty) {
@@ -91,16 +96,19 @@ export function endLine(): void {
 }
 
 /**
- * 开启鼠标跟踪（SGR 扩展模式，能拿到精确的行列坐标）。
- * 注意：开启后终端会用鼠标事件代替「拖选文本」，退出前**必须**调用 disableMouse()。
+ * 开启鼠标跟踪。
+ * 用 ?1002h（button-event）而不是 ?1000h：前者在按住左键移动时会持续上报运动事件，
+ * 这是实现「左键拖拽选择文本」的前提；配合 ?1006h 得到 SGR 精确坐标。
+ * 选择由本程序自己渲染与复制（终端原生的选区我们读不到）。
+ * 注意：退出前**必须**调用 disableMouse()，否则会一直吞掉鼠标事件。
  */
 export function enableMouse(): void {
-	if (isTty) process.stdout.write("\u001b[?1000h\u001b[?1006h");
+	if (isTty) process.stdout.write("\u001b[?1002h\u001b[?1006h");
 }
 
 /** 关闭鼠标跟踪（恢复终端的原生拖选行为） */
 export function disableMouse(): void {
-	if (isTty) process.stdout.write("\u001b[?1000l\u001b[?1006l");
+	if (isTty) process.stdout.write("\u001b[?1002l\u001b[?1006l");
 }
 
 /** 覆盖当前行（用于刷新状态栏） */

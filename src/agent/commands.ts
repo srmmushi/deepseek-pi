@@ -23,6 +23,8 @@ export interface CommandOutcome {
 	handled: boolean;
 	/** 请求退出 REPL */
 	exit: boolean;
+	/** /goto：请求 REPL 进入提示词选择模式（值为用户输入的参数，可为空） */
+	goto?: string;
 }
 
 const NOT_HANDLED: CommandOutcome = { handled: false, exit: false };
@@ -271,6 +273,11 @@ export async function handleCommand(
 			out.print(app.getSystemPrompt());
 			out.print("────────────────────────────────");
 			return HANDLED;
+		}
+
+		// ── 跳转（真正的选择 UI 由 REPL 承载，这里只转发意图）──
+		case "/goto": {
+			return { handled: true, exit: false, goto: args };
 		}
 
 		case "/clear": {

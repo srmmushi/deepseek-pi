@@ -25,6 +25,12 @@ export const COMMAND_SPECS: CommandSpec[] = [
 		zh: "查看 / 列出 / 切换会话",
 		en: "Show / list / switch sessions",
 	},
+	{
+		name: "/goto",
+		args: "[#编号]",
+		zh: "跳转到某条提示词的位置（交互选择）",
+		en: "Jump to a prompt's position (interactive picker)",
+	},
 	{ name: "/clear", zh: "重置当前会话上下文", en: "Reset current session context" },
 	{ name: "/thinking", args: "[on|off]", zh: "深度思考开关（Ctrl+T）", en: "Toggle deep thinking (Ctrl+T)" },
 	{ name: "/search", args: "[on|off]", zh: "智能搜索开关（Ctrl+S）", en: "Toggle smart search (Ctrl+S)" },

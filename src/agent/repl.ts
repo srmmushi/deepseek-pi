@@ -3,32 +3,32 @@
 // 屏幕布局（自上而下）：
 //   1. 启动头部：DSP ASCII 字形 + 登录状态（保持极简）
 //   2. 主输出区：对话流、思考、工具调用、! 命令结果（滚动区域 1..rows-2）
-//   3. 输入行：❯ 对话 / ! 命令（停在滚动区域底部）
-//   4. 提示行：分隔线，输入 / 时变为命令补全
-//   5. 状态栏：会话 · 模型 · 思考 · 搜索 · 语言   ← 固定在屏幕最底部
+//   3. 输入行：❯ 对话 / ! 命令（滚动区域最后一行）
+//   4. 提示行：分隔线 / 命令补全
+//   5. 状态栏：会话 · 模型 · 思考 · 搜索 · 语言 · 滚动位置   ← 固定在屏幕最底部
 //
 // 输入约定：
 //   普通文本 → 发送给 Agent
 //   /xxx     → 斜杠命令（输入 / 查看全部）
 //   !xxx     → 直接执行 shell 命令，结果只打印，不进入对话上下文
 //
-// 字形约定（一律不用 emoji，避免终端把符号渲染成彩色表情导致对不齐）：
-//   ▌ 工具调用 / 思考      └ 工具结果      · 元信息
+// 字形约定（一律不用 emoji）：▌ 工具调用/思考   └ 工具结果   · 元信息
 //
-// 折叠：思考与 exec 输出都是「块」，点击块头（或 Ctrl+O）展开 / 收起。
-// 滚动区域里的历史行无法单独擦除，所以主输出同时记入块渲染器的缓冲区，
-// 折叠时整体重排并重绘可见窗口 —— 详见 ui/renderer.ts。
+// 折叠与滚动：思考、exec 输出都是可折叠块；主输出区支持向上滚动查看历史。
+// 选择与复制：左键拖拽选择（自己渲染反显），右键或 Ctrl+C 复制到剪贴板；
+//   单击（没有拖拽）则切换块折叠。终端原生选区读不到，所以选择必须自实现。
+//   /goto 会列出本次会话发过的提示词，选中后滚动到它所在的位置。
 //
 // ⚠ 列偏移陷阱（曾导致输出覆盖已有内容）：
-//   raw 模式下 \n 只换行、不回列（Windows 上 libuv 会设 DISABLE_NEWLINE_AUTO_RETURN），
+//   raw 模式下 \n 只换行、不回列（Windows 上 libuv 设 DISABLE_NEWLINE_AUTO_RETURN），
 //   若某一行不先 \r 归位，列偏移会逐行累积，长行折行后越过滚动区域底边，
-//   整屏就开始互相覆盖。因此主输出统一走 info()，并由状态栏在每行写入前
-//   把光标钉回「滚动区域底部第 1 列」。
+//   整屏就开始互相覆盖。因此主输出统一走 info()，并由状态栏把光标钉在区域底部。
 import type { App } from "../app.js";
 import { isAuthError } from "../deepseek/provider.js";
 import { runShell } from "../tools/exec.js";
 import { describeCall, type ToolCall, type ToolName, type ToolResult } from "../tools/index.js";
 import { APP_FULL_NAME, APP_NAME, bannerLines } from "../ui/banner.js";
+import { copyToClipboard } from "../ui/clipboard.js";
 import { LineEditor, type EditorKey, type MouseEvent } from "../ui/line-editor.js";
 import {
 	color,
@@ -40,7 +40,7 @@ import {
 	writeLiveLine,
 } from "../ui/output.js";
 import { formatHint, printCommandPalette } from "../ui/palette.js";
-import { createRenderer, type Renderer } from "../ui/renderer.js";
+import { createRenderer, type Anchor, type Block, type Renderer, type Selection } from "../ui/renderer.js";
 import { createStatusBar } from "../ui/statusbar.js";
 import { alignRight, displayWidth, formatDuration, truncateTo } from "../ui/text.js";
 import { suggestCommands } from "./command-specs.js";
@@ -66,6 +66,8 @@ const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", 
 const SPINNER_INTERVAL_MS = 90;
 /** exec 输出超过这个行数时默认收起 */
 const EXEC_COLLAPSE_LINES = 6;
+/** 滚轮每格滚动的行数 */
+const WHEEL_STEP = 3;
 
 /** 按工具类型配色，一眼区分「读 / 写 / 列目录 / 执行 / 搜索」 */
 const TOOL_COLOR: Record<ToolName, (text: string) => string> = {
@@ -76,10 +78,9 @@ const TOOL_COLOR: Record<ToolName, (text: string) => string> = {
 	search: color.magenta,
 };
 
-/** 主输出门面：TTY 下走块渲染器（可折叠 + 整体重绘），否则逐行打印 */
+/** 主输出门面：TTY 下走块渲染器（可折叠/可滚动/可重绘），否则逐行打印 */
 interface Emitter {
 	line(text: string): void;
-	/** 可折叠块：非 TTY 下没有折叠概念，展开态直接铺开 */
 	block(head: string, body: string[], collapsed: boolean): void;
 }
 
@@ -110,9 +111,15 @@ interface UiState {
 	lastThinking: string;
 }
 
-/** 状态栏文本：会话 · 模型 · 思考 · 搜索 · 语言 */
-// busy 时高亮并显示已耗时（elapsedMs 为 undefined 表示不显示计时）
-export function statusLine(app: App, busy = false, elapsedMs?: number): string {
+/** 提示词跳转选择器 */
+interface Picker {
+	block: Block;
+	items: Anchor[];
+	index: number;
+}
+
+/** 状态栏文本：会话 · 模型 · 思考 · 搜索 · 语言（滚动时附带位置） */
+export function statusLine(app: App, busy = false, elapsedMs?: number, scrollRows = 0): string {
 	const { t } = app.i18n;
 	const flag = (value: boolean): string =>
 		value ? color.green(t("status.on")) : color.dim(t("status.off"));
@@ -121,13 +128,15 @@ export function statusLine(app: App, busy = false, elapsedMs?: number): string {
 	const title = busy
 		? `${color.yellow(app.activeSession.title)} ${color.yellow(`(${t("status.busy")}${timer}…)`)}`
 		: color.cyan(app.activeSession.title);
-	return [
+	const parts = [
 		`${marker} ${title}`,
 		color.bold(app.getModel().id),
 		`${t("status.thinking")} ${flag(app.config.thinking)}`,
 		`${t("status.search")} ${flag(app.config.search)}`,
 		color.dim(app.config.language),
-	].join(color.dim("  ·  "));
+	];
+	if (scrollRows > 0) parts.push(color.yellow(`↑${scrollRows}`));
+	return parts.join(color.dim("  ·  "));
 }
 
 /** 工具调用行：`  ▌ read   package.json` */
@@ -173,7 +182,6 @@ async function runShellLine(app: App, emit: Emitter, command: string): Promise<v
 		emit.line(`  ${color.dim(t("shell.usage"))}`);
 		return;
 	}
-	emit.line("");
 	emit.line(`  ${color.yellow(GLYPH_CALL)} ${color.yellow(command)}`);
 	const result = await runShell(command, app.cwd);
 	const body = result.output ? result.output.split("\n").map((line) => `  ${line}`) : [];
@@ -185,7 +193,6 @@ async function runShellLine(app: App, emit: Emitter, command: string): Promise<v
 		`  ${color.dim(GLYPH_RESULT)} ${state}`,
 		color.dim(formatDuration(result.durationMs)),
 	);
-	// shell 输出同样可折叠（超过阈值默认收起）
 	emit.block(head, body, body.length > EXEC_COLLAPSE_LINES);
 }
 
@@ -193,11 +200,9 @@ async function runShellLine(app: App, emit: Emitter, command: string): Promise<v
 function createTurnIO(app: App, ui: UiState, emit: Emitter, foldable: boolean): TurnIO {
 	const { t } = app.i18n;
 	const turnStartedAt = Date.now();
-	/** 当前并行批次 */
 	let batch: ToolCall[] = [];
 	let batchStartedAt = turnStartedAt;
 	let batchDone = 0;
-	/** 本次思考的显示状态 */
 	let thinkFolded = true;
 	let thinkStartedAt = turnStartedAt;
 	let spinTimer: ReturnType<typeof setInterval> | null = null;
@@ -210,7 +215,7 @@ function createTurnIO(app: App, ui: UiState, emit: Emitter, foldable: boolean): 
 		}
 	};
 
-	/** 原地刷新「⠋ Thinking 2.1s」活动行 */
+	/** 原地刷新「⠋ 思考 1.2s」活动行 */
 	const paintSpinner = (): void => {
 		const sec = ((Date.now() - thinkStartedAt) / 1000).toFixed(1);
 		const frame = SPINNER[spinFrame % SPINNER.length];
@@ -231,14 +236,12 @@ function createTurnIO(app: App, ui: UiState, emit: Emitter, foldable: boolean): 
 				process.stdout.write(`  ${color.dim(GLYPH_CALL)} ${color.dim(t("repl.thinkingLabel"))}  `);
 				return;
 			}
-			// 非 TTY 没有「活动行」，结束时打一行摘要即可
-			if (!foldable) return;
+			if (!foldable) return; // 非 TTY 没有「活动行」
 			paintSpinner();
 			spinTimer = setInterval(paintSpinner, SPINNER_INTERVAL_MS);
 		},
 		onThinkDelta(text) {
 			if (!thinkFolded) process.stdout.write(color.gray(text));
-			// 折叠态不显示正文：spinner 已在跑，正文只在块里留存
 		},
 		onThinkEnd(fullText, elapsedMs) {
 			stopSpinner();
@@ -252,7 +255,7 @@ function createTurnIO(app: App, ui: UiState, emit: Emitter, foldable: boolean): 
 				return;
 			}
 			ui.lastThinking = fullText;
-			// 折叠块头会覆盖掉相同位置的活动行（首行写入即覆盖）
+			// 折叠块头会覆盖掉同一位置的活动行
 			const head = `  ${color.dim(GLYPH_CALL)} ${color.dim(summary)} ${color.dim(`· ${t("repl.expand")}`)}`;
 			emit.block(head, thinkBody(fullText), true);
 		},
@@ -262,11 +265,10 @@ function createTurnIO(app: App, ui: UiState, emit: Emitter, foldable: boolean): 
 			emit.line("");
 		},
 		onContentDelta(text) {
-			// 内容按整行到达（loop 已按行切分），去掉尾部换行后逐行入库
 			emit.line(text.replace(/\n$/, ""));
 		},
 
-		// ── 工具：一批调用先列出，结果按完成顺序打印 ──
+		// ── 工具 ──
 		onToolBatchStart(calls) {
 			batch = calls;
 			batchDone = 0;
@@ -276,10 +278,8 @@ function createTurnIO(app: App, ui: UiState, emit: Emitter, foldable: boolean): 
 		},
 		onToolEnd(call, result, elapsedMs) {
 			batchDone += 1;
-			// 并行批次里结果顺序与调用顺序不一致，必须带工具名才好对应
 			const prefix = batch.length > 1 ? color.dim(call.name.padEnd(TOOL_NAME_WIDTH)) : "";
 			const head = toolResultLine(prefix, result.summary, result.ok, elapsedMs);
-			// exec 输出折叠：行数多时默认收起，点击块头展开
 			const body = call.name === "exec" && result.ok ? execBody(result) : [];
 			emit.block(head, body, body.length > EXEC_COLLAPSE_LINES);
 			if (batchDone >= batch.length && batch.length > 1) {
@@ -306,7 +306,7 @@ export async function startRepl(app: App): Promise<void> {
 	const { t } = app.i18n;
 	const ui: UiState = { lastThinking: "" };
 
-	// ── 底部状态栏与块渲染器 ──────────────────────────────
+	// ── 状态栏与块渲染器 ──────────────────────────────────
 	const bar = createStatusBar();
 	const render = bar.enabled
 		? createRenderer({ height: () => bar.height(), width: () => bar.width() })
@@ -314,9 +314,9 @@ export async function startRepl(app: App): Promise<void> {
 	const emit = createEmitter(render);
 	const defaultHint = color.dim("─".repeat(240));
 	let paletteShownFor: string | undefined;
+	let picker: Picker | null = null;
 
 	// ── 启动头部：极简，仅 ASCII 字形 + 登录状态 ──────────
-	// 经由 emit 写入，这样它也在渲染器缓冲区里，整体重绘时不会被擦掉
 	const token = app.getToken();
 	const stateText = token
 		? color.green(`✓ ${t("ui.loginOk", { len: token.length })}`)
@@ -329,14 +329,15 @@ export async function startRepl(app: App): Promise<void> {
 		emit.line(line);
 	}
 
-	// 初始化滚动区域（此前无 anchor，banner 正常写在顶部），再挂上光标归位
+	// 初始化滚动区域（此前无 anchor，banner 写在顶部），再挂上光标归位
 	bar.set(defaultHint, statusLine(app));
 	setOutputAnchor(bar.enabled ? () => bar.anchorCursor() : null);
 	if (!bar.enabled) info(statusLine(app));
 
-	/** 刷新底部状态栏；非 TTY 时降级为一次性打印状态行 */
+	const scrollRows = (): number => render?.offset() ?? 0;
+
 	const refreshUi = (): void => {
-		if (bar.enabled) bar.set(defaultHint, statusLine(app));
+		if (bar.enabled) bar.set(defaultHint, statusLine(app, false, undefined, scrollRows()));
 	};
 
 	// ── 忙碌态与实时计时 ──────────────────────────────────
@@ -352,25 +353,202 @@ export async function startRepl(app: App): Promise<void> {
 		}
 	};
 
-	/** 切换忙碌状态（状态栏高亮 + 每秒刷新已耗时） */
 	const setBusy = (next: boolean): void => {
 		busy = next;
 		stopBusyTimer();
 		if (next) busyStartedAt = Date.now();
-		bar.set(defaultHint, statusLine(app, busy, next ? 0 : undefined));
+		bar.set(defaultHint, statusLine(app, busy, next ? 0 : undefined, scrollRows()));
 		if (next && bar.enabled) {
 			busyTimer = setInterval(() => {
-				bar.set(defaultHint, statusLine(app, true, Date.now() - busyStartedAt));
+				bar.set(
+					defaultHint,
+					statusLine(app, true, Date.now() - busyStartedAt, scrollRows()),
+				);
 			}, 1000);
 		}
 	};
 
-	/** 生成状态栏文本（busy 时带上已耗时） */
 	const barStatus = (): string =>
-		statusLine(app, busy, busy ? Date.now() - busyStartedAt : undefined);
+		statusLine(app, busy, busy ? Date.now() - busyStartedAt : undefined, scrollRows());
+
+	// ── 选择与复制 ────────────────────────────────────────
+	let selection: Selection | null = null;
+	let dragAnchor: { row: number; col: number } | null = null;
+	let pressRow = 0;
+	let pressCol = 0;
+	let dragging = false;
+
+	const clearSelection = (): void => {
+		if (!selection) return;
+		selection = null;
+		render?.setSelection(null);
+	};
+
+	const copySelection = async (): Promise<void> => {
+		if (!render || !selection) return;
+		const text = render.selectionText(selection);
+		clearSelection();
+		if (!text) {
+			editor.redraw();
+			return;
+		}
+		const ok = await copyToClipboard(text);
+		editor.erase();
+		emit.line(
+			ok
+				? `  ${color.green(t("repl.copied", { chars: text.length }))}`
+				: `  ${color.red(t("repl.copyFailed"))}`,
+		);
+		bar.refresh();
+		editor.redraw();
+	};
+
+	// ── 提示词跳转选择器 ──────────────────────────────────
+	const pickerBody = (items: Anchor[], index: number): string[] => {
+		const lines = items.map((a, i) =>
+			i === index
+				? `${color.cyan("  ▸ ")}${color.bold(`#${i + 1}`)}  ${a.label}`
+				: color.dim(`    #${i + 1}  ${a.label}`),
+		);
+		lines.push(color.dim(`  ${t("goto.hint")}`));
+		return lines;
+	};
+
+	const closePicker = (message: string): void => {
+		if (!picker) return;
+		const block = picker.block;
+		picker = null;
+		render?.update(block, [message]);
+	};
+
+	const movePicker = (delta: number): void => {
+		if (!picker || !render) return;
+		const next = picker.index + delta;
+		if (next < 0 || next >= picker.items.length) return;
+		picker.index = next;
+		render.update(picker.block, pickerBody(picker.items, next));
+	};
+
+	const confirmPicker = (): void => {
+		if (!picker || !render) return;
+		const { items, index } = picker;
+		const target = items[index];
+		render.scrollToItem(target.itemIndex);
+		closePicker(color.green(`  ${t("goto.jumped", { index: index + 1, label: target.label })}`));
+	};
+
+	const openGoto = (raw: string): void => {
+		if (!render) return;
+		const items = render.anchors();
+		if (items.length === 0) {
+			emit.line(color.dim(`  ${t("goto.empty")}`));
+			return;
+		}
+		// /goto 3 直接跳转，不带参数则弹出选择框
+		const direct = /^#?(\d+)$/.exec(raw.trim());
+		if (direct) {
+			const index = Number(direct[1]) - 1;
+			if (index < 0 || index >= items.length) {
+				emit.line(color.yellow(`  ${t("goto.outOfRange", { max: items.length })}`));
+				return;
+			}
+			render.scrollToItem(items[index].itemIndex);
+			emit.line(
+				color.green(`  ${t("goto.jumped", { index: index + 1, label: items[index].label })}`),
+			);
+			return;
+		}
+		picker = {
+			items,
+			index: 0,
+			block: render.block(color.bold(`  ${t("goto.title")}`), pickerBody(items, 0), false),
+		};
+	};
+
+	/** 回显用户输入：同时进入渲染器缓冲区，保证整体重绘不会丢掉它 */
+	const echoInput = (text: string): void => {
+		emit.line(`${color.cyan("❯ ")}${color.bold(text)}`);
+	};
+
+	/** 记录提示词锚点（必须在回显之前调用，这样锚点指向回显那一行） */
+	const rememberPrompt = (text: string): void => {
+		render?.anchor(truncateTo(text.replace(/\s+/g, " ").trim(), 60));
+	};
+
+	// ── 鼠标 ──────────────────────────────────────────────
+	const onMouse = (event: MouseEvent): void => {
+		if (!render) return;
+		const contentRows = Math.max(3, bar.height() - 1); // 最后一行是输入行
+
+		// 滚轮：浏览历史
+		if (event.button === 64 || event.button === 65) {
+			clearSelection();
+			render.scrollBy(event.button === 64 ? WHEEL_STEP : -WHEEL_STEP);
+			bar.set(defaultHint, barStatus());
+			return;
+		}
+
+		// 右键：复制当前选择
+		if (event.button === 2) {
+			if (!event.release) void copySelection();
+			return;
+		}
+
+		if (event.button !== 0 && event.button !== 32) return;
+		// 输入行与面板不属于主输出
+		if (event.y > contentRows) return;
+		const y = Math.max(1, event.y);
+		const x = Math.max(1, event.x);
+
+		// 左键按下：记录起点，同时清掉上一次的选择
+		if (event.button === 0 && !event.release) {
+			pressRow = y;
+			pressCol = x;
+			dragAnchor = { row: y, col: x };
+			dragging = false;
+			clearSelection();
+			return;
+		}
+
+		// 按住左键移动：扩展选择（?1002h 才会持续上报运动事件）
+		if (event.button === 32) {
+			if (!dragAnchor) return;
+			if (Math.abs(y - pressRow) > 0 || Math.abs(x - pressCol) > 0) dragging = true;
+			selection = { startRow: dragAnchor.row, startCol: dragAnchor.col, endRow: y, endCol: x };
+			render.setSelection(selection);
+			return;
+		}
+
+		// 左键抬起
+		dragAnchor = null;
+		if (dragging && selection) return; // 拖拽结束：保留高亮，等右键 / Ctrl+C 复制
+		dragging = false;
+		// 纯点击：切换块折叠
+		clearSelection();
+		const block = render.blockAtRow(y);
+		if (!block) return;
+		editor.erase();
+		render.toggle(block);
+		bar.refresh();
+		editor.redraw();
+	};
+
+	/** 展开 / 折叠思考内容；展开时回放最近一次思考全文 */
+	const toggleThinkingView = (): void => {
+		const next = !app.config.showThinking;
+		app.setShowThinking(next);
+		editor.erase();
+		emit.line(`  ${color.dim(t("toggle.thinkingView", { state: next ? t("status.on") : t("status.off") }))}`);
+		if (next) {
+			const body = thinkBody(ui.lastThinking);
+			if (body.length === 0) emit.line(color.dim(`  ${t("repl.noThinking")}`));
+			else for (const line of body) emit.line(line);
+		}
+		editor.redraw();
+		bar.set(defaultHint, barStatus());
+	};
 
 	const showPalette = (): void => {
-		// 先清掉输入行 → 把命令面板打印到主输出区 → 再重绘输入行
 		editor.erase();
 		printCommandPalette(app.i18n.lang, emit.line);
 		editor.redraw();
@@ -393,7 +571,6 @@ export async function startRepl(app: App): Promise<void> {
 		bar.set(defaultHint, barStatus());
 	};
 
-	/** 输入以 ! 开头时切换到 shell 提示符，让模式一眼可见 */
 	const syncPrompt = (): void => {
 		editor.setPrompt(editor.line.startsWith("!") ? PROMPT_SHELL : PROMPT_CHAT);
 	};
@@ -405,43 +582,37 @@ export async function startRepl(app: App): Promise<void> {
 		editor.redraw();
 	};
 
-	/** 展开 / 折叠思考内容；展开时回放最近一次思考全文 */
-	const toggleThinkingView = (): void => {
-		const next = !app.config.showThinking;
-		app.setShowThinking(next);
-		editor.erase();
-		emit.line("");
-		emit.line(
-			`  ${color.dim(
-				t("toggle.thinkingView", { state: next ? t("status.on") : t("status.off") }),
-			)}`,
-		);
-		if (next) {
-			const body = thinkBody(ui.lastThinking);
-			if (body.length === 0) emit.line(color.dim(`  ${t("repl.noThinking")}`));
-			else for (const line of body) emit.line(line);
-		}
-		editor.redraw();
+	/** 键盘侧的历史导航 */
+	const scrollByKeyboard = (toBottom: boolean): void => {
+		if (!render) return;
+		clearSelection();
+		if (toBottom) render.scrollToBottom();
+		else render.scrollBy(1 << 30); // 大幅上滚，越界会被渲染器夹到顶部
 		bar.set(defaultHint, barStatus());
-	};
-
-	/** 鼠标点击：命中可折叠块头则切换折叠 */
-	const onMouse = (event: MouseEvent): void => {
-		if (event.release || event.button !== 0 || !render) return;
-		// 面板两行不属于主输出
-		if (event.y > bar.height()) return;
-		const block = render.blockAtRow(event.y);
-		if (!block) return;
-		editor.erase();
-		render.toggle(block);
-		bar.refresh();
 		editor.redraw();
 	};
 
 	const editor = new LineEditor({
 		prompt: PROMPT_CHAT,
-		// 输入中：拦截快捷键；其余交给编辑器，稍后刷新补全提示
+		// 输入行交由我们改写为带样式的回显，所以编辑器自己不要换行
+		keepInputLine: true,
 		onKey: (key: EditorKey): boolean => {
+			// 选择器打开时接管全部按键
+			if (picker) {
+				if (key.name === "up" || key.name === "k") movePicker(-1);
+				else if (key.name === "down" || key.name === "j") movePicker(1);
+				else if (key.name === "return" || key.name === "enter") confirmPicker();
+				else if (key.name === "escape" || (key.ctrl && key.name === "c")) {
+					closePicker(color.dim(`  ${t("goto.cancelled")}`));
+				}
+				return true;
+			}
+			if (key.ctrl && key.name === "c") {
+				// 有选择就先复制，否则才是中断生成
+				if (selection) void copySelection();
+				else activeAbort?.abort();
+				return true;
+			}
 			if (key.ctrl && key.name === "t") {
 				toggle("thinking");
 				return true;
@@ -454,31 +625,39 @@ export async function startRepl(app: App): Promise<void> {
 				toggleThinkingView();
 				return true;
 			}
+			if (key.ctrl && key.name === "down") {
+				scrollByKeyboard(true);
+				return true;
+			}
+			if (key.ctrl && key.name === "up") {
+				scrollByKeyboard(false);
+				return true;
+			}
 			setImmediate(() => {
 				syncPrompt();
 				updateHint();
 			});
 			return false;
 		},
-		// 非输入状态（流式输出中）：只处理中断与开关。
+		// 非输入状态（流式输出中）：只处理中断、滚动与开关。
 		// 这里刻意不处理 Ctrl+O —— 展开需要排版输出，不能与流式写入并发。
 		onIdleKey: (key: EditorKey): void => {
 			if (key.ctrl && key.name === "c") {
-				activeAbort?.abort();
+				if (selection) void copySelection();
+				else activeAbort?.abort();
 				return;
 			}
-			if (key.ctrl && key.name === "t") toggle("thinking");
+			if (key.ctrl && key.name === "down") scrollByKeyboard(true);
+			else if (key.ctrl && key.name === "up") scrollByKeyboard(false);
+			else if (key.ctrl && key.name === "t") toggle("thinking");
 			else if (key.ctrl && key.name === "s") toggle("search");
 		},
 		onMouse,
 	});
-	// 开启鼠标跟踪，让「点击块头折叠」可用（退出时必须关闭，否则会吞掉拖选）
 	if (bar.enabled) enableMouse();
 	refreshUi();
 
 	// ── 尺寸变化 ──────────────────────────────────────────
-	// 顺序很重要：handleResize 重建滚动区域并重新锚定光标，
-	// 之后按新宽度整体重排可见窗口，最后重绘输入行。
 	process.stdout.on("resize", () => {
 		bar.handleResize();
 		render?.repaint();
@@ -510,9 +689,17 @@ export async function startRepl(app: App): Promise<void> {
 
 			const trimmed = input.trim();
 			if (!trimmed) {
+				editor.erase();
 				refreshUi();
 				continue;
 			}
+
+			// 空选择器残留时先关掉
+			if (picker) closePicker(color.dim(`  ${t("goto.cancelled")}`));
+
+			// 回显用户输入（覆盖输入行，同时进入渲染器缓冲区）
+			echoInput(trimmed);
+			clearSelection();
 
 			// `!命令`：直接执行 shell，不进入对话上下文
 			if (trimmed.startsWith("!")) {
@@ -534,11 +721,17 @@ export async function startRepl(app: App): Promise<void> {
 			if (trimmed.startsWith("/")) {
 				const outcome = await handleCommand(app, trimmed, io);
 				if (outcome.exit) break;
+				if (outcome.goto !== undefined) {
+					openGoto(outcome.goto);
+					refreshUi();
+					continue;
+				}
 				refreshUi();
 				continue;
 			}
 
-			// 普通对话
+			// 普通对话：先记锚点（供 /goto），再跑一轮
+			rememberPrompt(trimmed);
 			const controller = new AbortController();
 			activeAbort = controller;
 			setBusy(true);
@@ -548,7 +741,6 @@ export async function startRepl(app: App): Promise<void> {
 				if (controller.signal.aborted) {
 					emit.line(color.dim(`  ${t("repl.stopped")}`));
 				} else {
-					// token 失效时清掉本地凭证，避免"看起来已登录、实际用不了"
 					if (isAuthError(e)) app.clearAuthStore();
 					printError(`  ${describeError(app, e)}`);
 				}
