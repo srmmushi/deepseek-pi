@@ -303,6 +303,7 @@ pub fn report(config_dir: &str, lang: Lang) -> Vec<String> {
     let l_arch = if zh { "架构" } else { "Arch" };
     let l_host = if zh { "主机名" } else { "Host" };
     let l_vm = if zh { "虚拟机" } else { "VM" };
+    let l_user = if zh { "用户名" } else { "User" };
     let l_dir = if zh { "配置目录" } else { "Config dir" };
 
     out.push(format!("  {}{}", pad(l_app, 12), info.app_version));
@@ -313,6 +314,8 @@ pub fn report(config_dir: &str, lang: Lang) -> Vec<String> {
     }
     out.push(format!("  {}{}", pad(l_arch, 12), info.arch));
     out.push(format!("  {}{}", pad(l_host, 12), info.host));
+    // 系统登录名（不是 DeepSeek 账号名 —— 账号名要问服务端，见 README 说明）
+    out.push(format!("  {}{}", pad(l_user, 12), whoami::username()));
     out.push(format!("  {}{}", pad(l_dir, 12), config_dir));
 
     // 虚拟机：只识别 WSL，其他系统不输出这一行

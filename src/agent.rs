@@ -260,6 +260,8 @@ pub fn run_turn(
     let result_prefix = tool_result_prefix(lang);
     let mut outgoing = build_outgoing(&runtime.config, session, system_text, user_input);
     let mut steps = 0usize;
+    // 网页会话失效只自动重开一次，否则会死循环
+    let mut handle_reset = false;
 
     loop {
         if *runtime.aborted.lock().unwrap() {
@@ -400,6 +402,25 @@ pub fn run_turn(
         }
 
         if let Err(e) = stream_result {
+            // 服务端常见的一种错误码：HTTP 200、code=0，但
+            // biz_code=1 + biz_msg="invalid chat session id" ——
+            // 说明绑定的那个网页会话已经没了（换过会话、或在网页端删了）。
+            // 这种情况丢掉绑定重开一次，比把错误甩给用户有用得多。
+            let text = e.to_string();
+            if !handle_reset
+                && (text.contains("invalid chat session")
+                    || text.contains("invalid_chat_session")
+                    || text.contains("chat_session_id"))
+            {
+                handle_reset = true;
+                session.handle.session_id = None;
+                session.handle.parent_message_id = None;
+                outgoing = build_outgoing(&runtime.config, session, system_text, user_input);
+                let _ = tx.send(UiEvent::Notice(
+                    "网页会话已失效，已重开会话并重试。".to_string(),
+                ));
+                continue;
+            }
             let (msg, auth) = describe_error(lang, &e);
             let _ = tx.send(UiEvent::Error(msg));
             if auth {

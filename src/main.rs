@@ -779,6 +779,7 @@ fn command(
             core.session_title = "新会话".to_string();
             core.total_tokens = 0;
             core.last_rate = None;
+            app.clear_all();
             app.set_status(core.status_text());
             app.line_styled("已新建会话。", ui::ok());
         }
@@ -854,9 +855,9 @@ fn open_login_page(core: &mut Core, app: &mut App, rx: &mut Option<Receiver<UiEv
         }
     }
 
-    // 1) 浏览器里已经登录过：直接拿来用，页面都不用开
-    if let Some((who, token)) = browser::extract_user_token() {
-        app.line_styled(format!("从 {who} 的存储里读到了已登录的 userToken"), ui::dim());
+    // 1) 浏览器里已经登录过：直接拿来用，页面都不用开。
+    //    这里不额外打字，成功提示统一由 do_login 给。
+    if let Some((_who, token)) = browser::extract_user_token() {
         do_login(core, app, &token);
         return;
     }
@@ -894,8 +895,7 @@ fn open_login_page(core: &mut Core, app: &mut App, rx: &mut Option<Receiver<UiEv
         // 每 2 秒扫一次，最多等 5 分钟
         for _ in 0..150 {
             std::thread::sleep(Duration::from_secs(2));
-            if let Some((who, token)) = browser::extract_user_token() {
-                let _ = tx.send(UiEvent::Line(format!("已从 {who} 读取到 userToken")));
+            if let Some((_who, token)) = browser::extract_user_token() {
                 let _ = tx.send(UiEvent::Token(token));
                 let _ = tx.send(UiEvent::Finished);
                 return;

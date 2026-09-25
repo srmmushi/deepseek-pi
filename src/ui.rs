@@ -343,6 +343,18 @@ impl App {
         }
     }
 
+    /// 清空输出区（/new 用）。保留状态栏与输入行。
+    pub fn clear_all(&mut self) {
+        self.items.clear();
+        self.rows.clear();
+        self.anchors.clear();
+        self.selection = None;
+        self.origin = None;
+        self.dragging = false;
+        self.offset = 0;
+        self.last_thinking.clear();
+    }
+
     pub fn set_busy(&mut self, value: bool) {
         self.busy = value;
         if value {
