@@ -62,7 +62,8 @@ DSP (deepseek-pi) —— 终端编程助手，仅使用 DeepSeek 网页版
   /new               新建会话（清空上下文）
   /session           列出当前目录的会话
   /session all       列出全部会话（附路径，按终端宽度收窄）
-  /session <序号>    进入该会话并载入上下文
+  /session <序号>    进入该会话：清屏并回放全部上下文（含思考）
+  /session debug     诊断网页会话绑定（会话名取不回来时用它）
   /export            把本次会话导出成 Markdown（写在当前目录）
 
 环境
@@ -161,7 +162,8 @@ fn main() {
         // 与 /info 同一份内容，但不需要进 TUI —— 也方便贴到 bug 报告里
         let config = config::load_config(&paths);
         let dir = paths.config_dir.display().to_string();
-        for line in sysinfo::report(&dir, config.language) {
+        let login = auth::load_auth(&paths);
+        for line in sysinfo::report(&dir, login.as_ref(), config.language) {
             println!("{line}");
         }
         return;
@@ -705,7 +707,8 @@ fn command(
         }
         "/info" => {
             let dir = core.paths.config_dir.display().to_string();
-            for line in sysinfo::report(&dir, lang) {
+            let login = auth::load_auth(&core.paths);
+            for line in sysinfo::report(&dir, login.as_ref(), lang) {
                 app.line(line);
             }
         }
@@ -839,14 +842,52 @@ fn command(
                         ui::user_style(),
                     );
                     for (i, s) in mine.iter().enumerate() {
+                        let count = s.messages.iter().filter(|(r, _)| r != "think").count();
                         app.line(format!(
                             "  #{:<3}{:<24}{} 条消息",
                             i + 1,
                             truncate(&s.title, 22),
-                            s.messages.len()
+                            count
                         ));
                     }
                     app.line_styled("用 /session <序号> 进入该会话并载入上下文。", ui::dim());
+                }
+            } else if arg.eq_ignore_ascii_case("debug") {
+                // 网页端会话名取不回来时用它：把绑定状态与接口原始返回都摊开
+                let s = core.session.lock().unwrap().clone();
+                app.line_styled("会话绑定诊断", ui::user_style());
+                app.line(format!("  本地会话 id   {}", s.id));
+                app.line(format!("  当前标题      {}", s.title));
+                app.line(format!(
+                    "  网页会话 id   {}",
+                    s.handle
+                        .session_id
+                        .clone()
+                        .unwrap_or_else(|| "（空）".to_string())
+                ));
+                app.line(format!(
+                    "  父消息 id     {}",
+                    s.handle
+                        .parent_message_id
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "（空）".to_string())
+                ));
+                match core.token.clone() {
+                    None => app.line_styled("  未登录，无法查询。", ui::warn()),
+                    Some(token) => match core.client() {
+                        Err(e) => app.line_styled(format!("  {e}"), ui::err()),
+                        Ok(client) => match client.session_list_raw(&token) {
+                            Some(raw) => {
+                                app.line_styled(
+                                    "  /chat_session/fetch_page 原始返回（截断）：",
+                                    ui::dim(),
+                                );
+                                app.line(format!("  {raw}"));
+                            }
+                            None => app
+                                .line_styled("  接口请求失败，看 /status 有没有报错。", ui::warn()),
+                        },
+                    },
                 }
             } else {
                 let index = match arg.trim_start_matches('#').parse::<usize>() {
@@ -857,16 +898,27 @@ fn command(
                     }
                 };
                 let picked = mine[index].clone();
-                let count = picked.messages.len();
+                // 思考只用于回放，不算进「几条上下文」
+                let count = picked
+                    .messages
+                    .iter()
+                    .filter(|(role, _)| role != "think")
+                    .count();
                 core.session_title = picked.title.clone();
-                *core.session.lock().unwrap() = picked;
+                *core.session.lock().unwrap() = picked.clone();
                 core.total_tokens = 0;
                 core.last_rate = None;
-                app.set_status(core.status_text());
+                // 清屏并完整回放：不再只给一行「载入 N 条上下文」
+                app.clear_all();
                 app.line_styled(
-                    format!("已进入 {}（载入 {count} 条上下文）", core.session_title),
-                    ui::ok(),
+                    format!("❯ 已进入「{}」（{count} 条上下文）", core.session_title),
+                    ui::user_style(),
                 );
+                for (role, content) in &picked.messages {
+                    app.replay(role, content);
+                }
+                app.line("");
+                app.set_status(core.status_text());
             }
         }
         "/export" => {
@@ -1245,6 +1297,7 @@ fn export_markdown(session: &Session, path: &std::path::Path) -> std::io::Result
         let who = match role.as_str() {
             "user" => "用户",
             "assistant" => "助手",
+            "think" => "思考",
             _ => "工具结果",
         };
         out.push_str(&format!("## {who}\n\n{content}\n\n"));

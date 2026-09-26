@@ -28,8 +28,8 @@ pub enum UiEvent {
     Line(String),
     /// 思考开始（UI 起 spinner 计时）
     ThinkStart,
-    /// 思考进度（只传字数，spinner 由 UI 绘制）
-    ThinkProgress { chars: usize },
+    /// 思考进度：带上增量正文，界面直接往「正在思考」块里追加
+    ThinkProgress { delta: String },
     /// 思考结束（带上全文，供展开回放）
     ThinkEnd { text: String, ms: u128 },
     /// 工具批次开始：调用一次性列出
@@ -83,23 +83,125 @@ impl Session {
         }
     }
 
+    /// 落盘：`sessions/<id>/context.md`
     pub fn save(&self, dir: &Path) -> std::io::Result<()> {
-        std::fs::create_dir_all(dir)?;
-        let text = serde_json::to_string_pretty(self).unwrap_or_default();
-        std::fs::write(dir.join(format!("{}.json", self.id)), format!("{text}\n"))
+        let sdir = dir.join(&self.id);
+        std::fs::create_dir_all(&sdir)?;
+        std::fs::write(sdir.join("context.md"), self.to_markdown())
     }
 
-    /// 按最近使用排序
+    /// 整份会话写成 Markdown：元数据在最前面一条 HTML 注释里（JSON，不占正文），
+    /// 每条消息以 `<!-- msg: 角色 -->` 打头。
+    ///
+    /// 为什么不用 `## 用户` 这类标题分隔：模型自己写的内容里就可能出现 `## `，
+    /// 那样读回来会把一条消息切成两条。HTML 注释不会和正文撞车。
+    fn to_markdown(&self) -> String {
+        let meta = serde_json::json!({
+            "id": self.id,
+            "title": self.title,
+            "cwd": self.cwd.display().to_string(),
+            "updated_at": self.updated_at,
+            "session_id": self.handle.session_id,
+            "parent_message_id": self.handle.parent_message_id,
+        });
+        let mut out = format!(
+            "# {}\n\n<!-- pi-meta {meta} -->\n\n\
+             <!-- 以下每条消息以 `<!-- msg: 角色 -->` 开头；角色取 user / assistant / think / tool -->\n",
+            self.title
+        );
+        for (role, content) in &self.messages {
+            out.push_str(&format!("\n<!-- msg: {role} -->\n{content}\n"));
+        }
+        out
+    }
+
+    /// 从 context.md 读回会话
+    fn from_markdown(text: &str) -> Option<Session> {
+        let meta_line = text
+            .lines()
+            .find(|l| l.trim_start().starts_with("<!-- pi-meta"))?;
+        let json = meta_line
+            .trim()
+            .trim_start_matches("<!--")
+            .trim_start_matches("pi-meta")
+            .trim_end_matches("-->")
+            .trim();
+        let meta: serde_json::Value = serde_json::from_str(json).ok()?;
+
+        let mut session = Session {
+            id: meta.get("id")?.as_str()?.to_string(),
+            title: meta
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("新会话")
+                .to_string(),
+            cwd: PathBuf::from(meta.get("cwd").and_then(|v| v.as_str()).unwrap_or(".")),
+            updated_at: meta.get("updated_at").and_then(|v| v.as_u64()).unwrap_or(0),
+            handle: WebSessionHandle {
+                session_id: meta
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                parent_message_id: meta.get("parent_message_id").and_then(|v| v.as_u64()),
+            },
+            messages: Vec::new(),
+        };
+
+        let mut role: Option<String> = None;
+        let mut buf = String::new();
+        for line in text.lines() {
+            if let Some(next) = parse_msg_marker(line) {
+                if let Some(prev) = role.replace(next) {
+                    session.messages.push((prev, buf.trim_end().to_string()));
+                }
+                buf.clear();
+                continue;
+            }
+            if role.is_some() {
+                buf.push_str(line);
+                buf.push('\n');
+            }
+        }
+        if let Some(prev) = role {
+            session.messages.push((prev, buf.trim_end().to_string()));
+        }
+        Some(session)
+    }
+
+    /// 按最近使用排序。顺带兼容旧的 `sessions/<id>.json`
+    /// （读到就一并列出，下次保存时自然写成新的 .md 结构）。
     pub fn list(dir: &Path) -> Vec<Session> {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return Vec::new();
         };
-        let mut out: Vec<Session> = entries
-            .flatten()
-            .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
-            .filter_map(|e| std::fs::read_to_string(e.path()).ok())
-            .filter_map(|t| serde_json::from_str(&t).ok())
-            .collect();
+        let paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        let mut seen = std::collections::HashSet::new();
+        let mut out: Vec<Session> = Vec::new();
+
+        // 新格式优先，这样同 id 的旧 json 会被新 .md 顶掉
+        for p in &paths {
+            if let Some(s) = std::fs::read_to_string(p.join("context.md"))
+                .ok()
+                .and_then(|t| Session::from_markdown(&t))
+            {
+                if seen.insert(s.id.clone()) {
+                    out.push(s);
+                }
+            }
+        }
+        for p in &paths {
+            if p.extension().is_some_and(|x| x == "json") {
+                if let Some(s) = std::fs::read_to_string(p)
+                    .ok()
+                    .and_then(|t| serde_json::from_str::<Session>(&t).ok())
+                {
+                    if seen.insert(s.id.clone()) {
+                        out.push(s);
+                    }
+                }
+            }
+        }
+
         out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         out
     }
@@ -108,6 +210,18 @@ impl Session {
     pub fn latest(dir: &Path) -> Option<Session> {
         Session::list(dir).into_iter().next()
     }
+}
+
+/// 解析 `<!-- msg: user -->` 这类分隔行
+fn parse_msg_marker(line: &str) -> Option<String> {
+    let inner = line
+        .trim()
+        .strip_prefix("<!--")?
+        .strip_suffix("-->")?
+        .trim()
+        .strip_prefix("msg:")?
+        .trim();
+    matches!(inner, "user" | "assistant" | "think" | "tool").then(|| inner.to_string())
 }
 
 /// 共享给后台线程的运行环境
@@ -128,8 +242,6 @@ struct Assembled {
     assistant: String,
     /// 思考全文
     think: String,
-    /// 已收到的思考字符数（UI 只用来画进度）
-    think_chars: usize,
     /// 已按行切分并上报的正文（避免重复上报）
     emitted_len: usize,
     /// 用于按行切分的残留
@@ -184,6 +296,10 @@ fn build_outgoing(
         ContextMode::Replay => {
             let mut parts = vec![format!("<｜System｜>{system_text}\n")];
             for (role, content) in &session.messages {
+                // think 只用于界面回放，不进模型上下文（省 token，也不去干扰推理）
+                if role == "think" {
+                    continue;
+                }
                 let tag = if role == "user" { "User" } else { "Assistant" };
                 parts.push(format!("<｜{tag}｜>{content}"));
             }
@@ -299,15 +415,15 @@ pub fn run_turn(
                     }
                     StreamEvent::ThinkDelta(text) => {
                         acc.think.push_str(&text);
-                        acc.think_chars += text.chars().count();
-                        let chars = acc.think_chars;
                         drop(acc);
-                        let _ = tx_cb.send(UiEvent::ThinkProgress { chars });
+                        // 把增量交给界面，让「正在思考」块实时长出内容
+                        let _ = tx_cb.send(UiEvent::ThinkProgress { delta: text });
                     }
                     StreamEvent::ContentStart => {
                         // 正文要开始了：先把思考块交出去，保证它排在正文上面
                         if !sent_cb.swap(true, Ordering::Relaxed) {
-                            let text = std::mem::take(&mut acc.think);
+                            // 用 clone 而不是 take：这份思考文本随后还要落进会话记录
+                            let text = acc.think.clone();
                             let ms = think_started.elapsed().as_millis();
                             drop(acc);
                             let _ = tx_cb.send(UiEvent::ThinkEnd { text, ms });
@@ -342,7 +458,7 @@ pub fn run_turn(
                             None
                         } else {
                             Some((
-                                std::mem::take(&mut acc.think),
+                                acc.think.clone(),
                                 think_started.elapsed().as_millis(),
                             ))
                         };
@@ -377,17 +493,14 @@ pub fn run_turn(
 
         let snapshot = {
             let acc = assembled.lock().unwrap();
-            (acc.assistant.clone(), acc.usage)
+            (acc.assistant.clone(), acc.think.clone(), acc.usage)
         };
-        let (assistant_text, usage) = snapshot;
+        let (assistant_text, think_text, usage) = snapshot;
 
         // 兜底：流式过程中途出错时既没走到 ContentStart 也没走到 Done，
-        // 思考态会一直挂在状态栏上，这里补一次收尾。
+        // 「正在思考」会一直挂在输出区上，这里补一次收尾。
         if !think_sent.swap(true, Ordering::Relaxed) {
-            let text = {
-                let mut acc = assembled.lock().unwrap();
-                std::mem::take(&mut acc.think)
-            };
+            let text = assembled.lock().unwrap().think.clone();
             let _ = tx.send(UiEvent::ThinkEnd {
                 text,
                 ms: stream_ms,
@@ -425,6 +538,13 @@ pub fn run_turn(
                 let _ = tx.send(UiEvent::AuthFailed);
             }
             break;
+        }
+
+        // 思考先于正文入账：界面回放时它本来就排在正文上面
+        if !think_text.trim().is_empty() {
+            session
+                .messages
+                .push(("think".to_string(), think_text.clone()));
         }
 
         session

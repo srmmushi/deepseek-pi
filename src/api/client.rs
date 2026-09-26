@@ -704,16 +704,39 @@ impl DeepSeekClient {
     /// 比我们按提示词截断出来的好看。接口形状若变动，这里返回 None，
     /// 调用方继续用本地标题，不影响任何功能。
     pub fn session_title(&self, token: &str, session_id: &str) -> Option<String> {
+        // 接口形状改过几次，所以这里不假设结构：列表可能叫
+        // chat_sessions / sessions，也可能再包一层 data —— 逐个试。
         let data = self
             .post_json(EP_SESSION_PAGE, token, &json!({ "count": 50 }))
             .ok()?;
-        data.get("chat_sessions")?
-            .as_array()?
-            .iter()
-            .find(|s| s.get("id").and_then(|v| v.as_str()) == Some(session_id))
+        if let Some(list) = session_list(&data) {
+            if let Some(title) = pick_title(list, session_id) {
+                return Some(title);
+            }
+        }
+        // 有些版本支持直接按 id 查，再试一次
+        let data = self
+            .post_json(
+                EP_SESSION_PAGE,
+                token,
+                &json!({ "count": 1, "chat_session_id": session_id }),
+            )
+            .ok()?;
+        let list = session_list(&data)?;
+        list.first()
             .and_then(|s| s.get("title").and_then(|v| v.as_str()))
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
+    }
+
+    /// 调试用：原样返回会话列表接口的响应（截断到 1500 字符）。
+    /// `/session debug` 打印它 —— 接口形状对不上时，一眼看出实际返回了什么。
+    pub fn session_list_raw(&self, token: &str) -> Option<String> {
+        let data = self
+            .post_json(EP_SESSION_PAGE, token, &json!({ "count": 50 }))
+            .ok()?;
+        let text = serde_json::to_string(&data).ok()?;
+        Some(text.chars().take(1500).collect())
     }
 
     /// 删除会话（失败静默）
@@ -801,6 +824,36 @@ impl DeepSeekClient {
 }
 
 // ── completion 编排 ─────────────────────────────────────────
+
+/// 会话列表可能藏在几个不同的键下面，也可能再包一层 data —— 逐个试
+fn session_list(data: &Value) -> Option<&Vec<Value>> {
+    for key in ["chat_sessions", "sessions", "chat_session"] {
+        if let Some(arr) = data.get(key).and_then(|v| v.as_array()) {
+            return Some(arr);
+        }
+    }
+    for key in ["data", "biz_data"] {
+        if let Some(inner) = data.get(key) {
+            if let Some(arr) = session_list(inner) {
+                return Some(arr);
+            }
+        }
+    }
+    None
+}
+
+/// 在列表里按 id 找标题；id 的键名同样试两种
+fn pick_title(list: &[Value], session_id: &str) -> Option<String> {
+    list.iter()
+        .find(|s| {
+            ["id", "chat_session_id"]
+                .iter()
+                .any(|k| s.get(*k).and_then(|v| v.as_str()) == Some(session_id))
+        })
+        .and_then(|s| s.get("title").and_then(|v| v.as_str()))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
 
 /// 网页会话句柄（复用模式）
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]

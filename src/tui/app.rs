@@ -135,6 +135,19 @@ struct Goto {
     cursor: usize,
 }
 
+/// 正在产出的「思考」块。
+///
+/// 内容边收边长：状态栏不再承担显示思考的职责，改由输出区这一块负责 ——
+/// 默认折叠成一行，点块头（或 Ctrl+O）就能看到已经想出来的内容。
+struct LiveThink {
+    /// 对应 `items` 里的下标
+    at: usize,
+    /// 已收到的思考全文
+    text: String,
+    /// 开始时刻（画计时用）
+    started: Instant,
+}
+
 pub struct App {
     items: Vec<Item>,
     rows: Vec<Row>,
@@ -148,10 +161,11 @@ pub struct App {
     hint: String,
 
     busy: bool,
-    think_since: Option<Instant>,
+    /// 本轮开始时刻（状态栏只显示一个通用计时，不再显示思考进度）
+    busy_since: Option<Instant>,
+    /// 正在产出的思考块
+    live_think: Option<LiveThink>,
     spinner: usize,
-    /// 本次思考已收到的字数，只用于状态栏
-    think_chars: usize,
 
     /// 登录输入模式：下一次提交当作凭证，不发给模型、也不进会话记录
     login_mode: bool,
@@ -190,9 +204,9 @@ impl Default for App {
             status: String::new(),
             hint: String::new(),
             busy: false,
-            think_since: None,
+            busy_since: None,
+            live_think: None,
             spinner: 0,
-            think_chars: 0,
             login_mode: false,
             login_mask: false,
             login_input: None,
@@ -238,6 +252,43 @@ impl App {
             collapsed,
             foldable: true,
         });
+    }
+
+    /// 回放一条历史消息（载入会话时用）。
+    ///
+    /// think 折成可展开的块，其余按角色上色；正文按行铺开 ——
+    /// 一次塞一整段带换行的文本，折行逻辑不好处理。
+    pub fn replay(&mut self, role: &str, text: &str) {
+        match role {
+            "think" => {
+                let head = format!(
+                    "▌ 思考 · {} 字 · 点击或 Ctrl+O 展开",
+                    text.chars().count()
+                );
+                let body: Vec<String> = text
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .map(|l| format!("    {l}"))
+                    .collect();
+                self.block(head, dim(), body, true);
+            }
+            "user" => {
+                self.line("");
+                for l in text.lines() {
+                    self.line_styled(format!("❯ {l}"), user_style());
+                }
+            }
+            "tool" => {
+                let body: Vec<String> = text.lines().map(|l| format!("  {l}")).collect();
+                self.block("└ 工具结果".to_string(), dim(), body, true);
+            }
+            _ => {
+                self.line("");
+                for l in text.lines() {
+                    self.line(l.to_string());
+                }
+            }
+        }
     }
 
     /// 启动头：ASCII 字形，右侧配版本与登录状态
@@ -291,28 +342,70 @@ impl App {
         match ev {
             UiEvent::Line(text) => self.line(text),
             UiEvent::ThinkStart => {
-                self.think_since = Some(Instant::now());
                 self.spinner = 0;
-                self.think_chars = 0;
+                // 状态栏不再显示思考：在输出区开一个「正在思考」块，
+                // 默认折叠，点块头（或 Ctrl+O）就能展开看实时内容。
+                self.items.push(Item {
+                    head: format!("▌ {} 正在思考 · 点击或 Ctrl+O 展开", SPINNER[0]),
+                    head_style: dim(),
+                    right: None,
+                    body: Vec::new(),
+                    body_style: dim(),
+                    collapsed: true,
+                    foldable: true,
+                });
+                self.live_think = Some(LiveThink {
+                    at: self.items.len() - 1,
+                    text: String::new(),
+                    started: Instant::now(),
+                });
             }
-            UiEvent::ThinkProgress { chars } => {
+            UiEvent::ThinkProgress { delta } => {
                 self.spinner = self.spinner.wrapping_add(1);
-                self.think_chars = chars;
+                let Some(live) = self.live_think.as_mut() else {
+                    return;
+                };
+                live.text.push_str(&delta);
+                let at = live.at;
+                let head = format!(
+                    "▌ {} 正在思考 {:.1}s · {} 字 · 点击或 Ctrl+O 展开",
+                    SPINNER[self.spinner % SPINNER.len()],
+                    live.started.elapsed().as_secs_f32(),
+                    live.text.chars().count()
+                );
+                let body: Vec<String> = live.text.lines().map(|l| format!("    {l}")).collect();
+                if let Some(item) = self.items.get_mut(at) {
+                    item.head = head;
+                    item.body = body;
+                }
             }
             UiEvent::ThinkEnd { text, ms } => {
-                self.think_since = None;
-                // 空思考（没开思考 / 模型没输出思考）只清状态，不留一行噪声
+                let live = self.live_think.take();
+                // 空思考（没开思考 / 模型没输出思考）不留噪声：把占位块撤掉
                 if text.trim().is_empty() {
+                    if let Some(live) = live {
+                        if live.at < self.items.len() {
+                            self.items.remove(live.at);
+                        }
+                    }
                     return;
                 }
                 let chars = text.chars().count();
-                let head = format!("▌ 思考 {} · {chars} 字 · Ctrl+O 展开", format_ms(ms));
+                let head = format!("▌ 思考 {} · {chars} 字 · 点击或 Ctrl+O 展开", format_ms(ms));
                 let body = text
                     .lines()
                     .filter(|l| !l.trim().is_empty())
                     .map(|l| format!("    {l}"))
                     .collect();
-                self.block(head, dim(), body, true);
+                match live {
+                    // 就地改成最终形态：用户正展开在看，就别替他收回去
+                    Some(live) if live.at < self.items.len() => {
+                        let item = &mut self.items[live.at];
+                        item.head = head;
+                        item.body = body;
+                    }
+                    _ => self.block(head, dim(), body, true),
+                }
             }
             UiEvent::ToolBatchStart(calls) => {
                 self.line("");
@@ -344,22 +437,22 @@ impl App {
                 bits.push(format_ms(ms));
                 self.line("");
                 self.line_styled(format!("· {}", bits.join("  ·  ")), dim());
-                self.busy = false;
+                self.set_busy(false);
             }
             UiEvent::Notice(text) => self.line_styled(format!("! {text}"), warn()),
             // 凭证由主循环落地，界面不显示原文
             UiEvent::Token(_) => {}
             UiEvent::Error(text) => {
-                self.busy = false;
-                self.think_since = None;
+                self.set_busy(false);
+                self.finish_live_think();
                 self.line_styled(format!("! {text}"), err());
             }
             UiEvent::AuthFailed => {
                 self.line_styled("凭证已失效，本地凭证已清除，请重新登录。", warn());
             }
             UiEvent::Finished => {
-                self.busy = false;
-                self.think_since = None;
+                self.set_busy(false);
+                self.finish_live_think();
             }
         }
     }
@@ -380,7 +473,7 @@ impl App {
             .collect()
     }
 
-    /// 清空输出区（/new 用）。保留状态栏与输入行。
+    /// 清空输出区（/new、载入会话前用）。保留状态栏与输入行。
     pub fn clear_all(&mut self) {
         self.items.clear();
         self.rows.clear();
@@ -389,10 +482,32 @@ impl App {
         self.origin = None;
         self.dragging = false;
         self.offset = 0;
+        self.live_think = None;
+    }
+
+    /// 流中途出错 / 结束时把「正在思考」冻结成一个普通块 ——
+    /// 否则它会一直挂着"正在思考"，看起来像卡住了。
+    fn finish_live_think(&mut self) {
+        let Some(live) = self.live_think.take() else {
+            return;
+        };
+        if live.text.trim().is_empty() {
+            if live.at < self.items.len() {
+                self.items.remove(live.at);
+            }
+            return;
+        }
+        if let Some(item) = self.items.get_mut(live.at) {
+            item.head = format!(
+                "▌ 思考（已中断）· {} 字 · 点击或 Ctrl+O 展开",
+                live.text.chars().count()
+            );
+        }
     }
 
     pub fn set_busy(&mut self, value: bool) {
         self.busy = value;
+        self.busy_since = value.then(Instant::now);
         if value {
             self.offset = 0;
         }
@@ -992,22 +1107,14 @@ impl App {
                 Lang::En => "↑/↓ select · Enter jump · Esc cancel".to_string(),
             };
         }
-        if self.busy {
-            let secs = self
-                .think_since
-                .map(|t| t.elapsed().as_secs_f32())
-                .unwrap_or(0.0);
-            if self.think_since.is_some() {
-                let word = if lang == Lang::Zh { "思考" } else { "Thinking" };
-                let unit = if lang == Lang::Zh { "字" } else { "chars" };
-                let chars = self.think_chars;
-                return format!(
-                    "{} {word} {secs:.1}s · {chars}{unit}    {}",
-                    SPINNER[self.spinner % SPINNER.len()],
-                    self.status
-                );
-            }
-            return format!("◆ {secs:.1}s    {}", self.status);
+        // 状态栏不再显示思考进度（那块在输出区），只留一个通用的忙碌计时
+        if let Some(since) = self.busy_since {
+            return format!(
+                "{} {:.1}s    {}",
+                SPINNER[self.spinner % SPINNER.len()],
+                since.elapsed().as_secs_f32(),
+                self.status
+            );
         }
         if self.offset > 0 {
             return format!("↑{}    {}", self.offset, self.status);

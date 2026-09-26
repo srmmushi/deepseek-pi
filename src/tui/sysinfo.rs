@@ -318,8 +318,21 @@ fn program_files(x86: bool) -> Option<PathBuf> {
 
 // ── /info 输出 ───────────────────────────────────────────────
 
-/// 生成 `/info` 的多行输出（已排版好）
-pub fn report(config_dir: &str, lang: Lang) -> Vec<String> {
+/// token 只留头尾：`/info` 是给人看的，也很可能被截图贴出去
+fn mask_token(token: &str) -> String {
+    let chars: Vec<char> = token.chars().collect();
+    if chars.len() <= 16 {
+        return "（过短，已隐藏）".to_string();
+    }
+    let head: String = chars[..8].iter().collect();
+    let tail: String = chars[chars.len() - 4..].iter().collect();
+    format!("{head}…{tail}（{} 字符）", chars.len())
+}
+
+/// 生成 `/info` 的多行输出（已排版好）。
+///
+/// `login` 传当前凭证，只用来在最后加一行「用户名 + 部分省略的 token」。
+pub fn report(config_dir: &str, login: Option<&crate::auth::AuthData>, lang: Lang) -> Vec<String> {
     let zh = lang == Lang::Zh;
     let info = collect();
 
@@ -356,6 +369,20 @@ pub fn report(config_dir: &str, lang: Lang) -> Vec<String> {
             None => String::new(),
         };
         out.push(format!("  {}{vm}{extra}", pad(l_vm, 12)));
+    }
+
+    // 登录：系统登录名 + 部分省略的 token（头尾各留几个字符）+ 指纹。
+    // 指纹是给排查用的：和浏览器里那份 token 的指纹一比就知道是不是同一个。
+    if let Some(auth) = login {
+        let l_login = if zh { "登录" } else { "Login" };
+        out.push(format!(
+            "  {}{} · token {} · {} {}",
+            pad(l_login, 12),
+            whoami::username(),
+            mask_token(&auth.token),
+            if zh { "指纹" } else { "fingerprint" },
+            crate::auth::token_fingerprint(&auth.token),
+        ));
     }
 
     out
