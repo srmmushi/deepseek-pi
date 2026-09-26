@@ -104,6 +104,38 @@ pub enum DoubleAction {
 /// 连按两下的有效窗口
 const DOUBLE_WINDOW: std::time::Duration = std::time::Duration::from_millis(2500);
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn citation_markers_become_compact() {
+        assert_eq!(
+            strip_citation("今天是9月26日[citation:1][citation:2]。"),
+            "今天是9月26日[1][2]。"
+        );
+        // 标记里的空格也认
+        assert_eq!(strip_citation("空格 [citation: 3] 也认"), "空格 [3] 也认");
+        // 没有标记就原样返回
+        assert_eq!(strip_citation("没有标记"), "没有标记");
+        // 被截断的标记先原样留着，不要吞掉后面的文字
+        assert_eq!(strip_citation("abc[citation:1"), "abc[citation:1");
+    }
+
+    #[test]
+    fn find_url_stops_at_punctuation() {
+        assert_eq!(
+            find_url("       http://a.com/x.html").as_deref(),
+            Some("http://a.com/x.html")
+        );
+        assert_eq!(
+            find_url("来源 https://b.cn/p），后面的话").as_deref(),
+            Some("https://b.cn/p")
+        );
+        assert_eq!(find_url("[1] 只有标题没有网址"), None);
+    }
+}
+
 /// 从一行文本里找出第一个 http(s) 网址（收起行尾的标点）
 fn find_url(text: &str) -> Option<String> {
     let at = text.find("http://").or_else(|| text.find("https://"))?;

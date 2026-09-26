@@ -337,6 +337,57 @@ fn parse_search_items(val: &Value) -> Option<Vec<SearchItem>> {
     (!items.is_empty()).then_some(items)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn feed(parser: &mut SseParser, value: serde_json::Value) -> Vec<StreamEvent> {
+        parser
+            .push(&format!("data: {value}\n\n"))
+            .expect("帧应当能解析")
+    }
+
+    #[test]
+    fn search_results_are_parsed() {
+        let mut parser = SseParser::new();
+        // 先来初始快照（无 p/o），再来来源补丁 —— 与实测抓到的顺序一致
+        feed(
+            &mut parser,
+            json!({"v":{"response":{"status":"WIP","fragments":[{"id":2,"type":"SEARCH"}]}}}),
+        );
+        let events = feed(
+            &mut parser,
+            json!({"p":"response/fragments/-1/results","v":[
+                {"url":"https://a.com/x","title":"标题","site_name":"a.com","cite_index":1}
+            ]}),
+        );
+        let items = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::SearchResults { items } => Some(items.clone()),
+                _ => None,
+            })
+            .expect("应当解析出搜索来源");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].url, "https://a.com/x");
+        assert_eq!(items[0].cite_index, 1);
+    }
+
+    #[test]
+    fn unrelated_results_array_is_ignored() {
+        let mut parser = SseParser::new();
+        // 路径对、但数组里没有 url：宁可什么都不显示，也不要当成来源
+        let events = feed(
+            &mut parser,
+            json!({"p":"response/fragments/-1/results","v":[{"foo":"bar"}]}),
+        );
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::SearchResults { .. })));
+    }
+}
+
 fn delta_for(frag_type: &str, content: &str) -> Vec<StreamEvent> {
     if content.is_empty() {
         return vec![];
