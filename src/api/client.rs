@@ -748,14 +748,19 @@ impl DeepSeekClient {
             .filter(|s| !s.is_empty())
     }
 
-    /// 调试用：原样返回会话列表接口的响应（截断到 1500 字符）。
-    /// `/session debug` 打印它 —— 接口形状对不上时，一眼看出实际返回了什么。
-    pub fn session_list_raw(&self, token: &str) -> Option<String> {
+    /// 调试用：原样返回会话列表接口的响应（按 `max_chars` 截断）。
+    /// `/session debug` 与 `--dump-session` 打印它 ——
+    /// 接口形状对不上时，一眼看出实际返回了什么。
+    pub fn session_list_raw(&self, token: &str, max_chars: usize) -> Option<String> {
         let data = self
             .post_json(EP_SESSION_PAGE, token, &json!({ "count": 50 }))
             .ok()?;
         let text = serde_json::to_string(&data).ok()?;
-        Some(text.chars().take(1500).collect())
+        let mut out: String = text.chars().take(max_chars).collect();
+        if text.chars().count() > max_chars {
+            out.push_str(" …（已截断）");
+        }
+        Some(out)
     }
 
     /// 删除会话（失败静默）

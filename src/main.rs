@@ -42,6 +42,8 @@ DSP (deepseek-pi) —— 终端编程助手，仅使用 DeepSeek 网页版
       --resume              接着最近一次会话继续
       --selftest            只做自检：打印机器指纹并尝试解密已保存的凭证
       --info                只打印环境信息（同 /info）后退出，不进界面
+      --dump-session        打印会话绑定诊断（网页会话 id、按 id 查标题的结果、
+                            列表接口的原始返回）后退出；排查会话名取不回来时用它
       --grab                只扫描浏览器存储并报告诊断；找到凭证就顺手保存
   -h, --help                显示本帮助
 
@@ -114,6 +116,8 @@ struct Args {
     info: bool,
     /// 只扫描浏览器存储并报告诊断结果（找到凭证就顺手保存）
     grab: bool,
+    /// --dump-session：打印会话绑定诊断后退出（不进界面，方便复制）
+    dump_session: bool,
     help: bool,
 }
 
@@ -125,6 +129,7 @@ fn parse_args(argv: &[String]) -> Args {
             "--help" | "-h" => args.help = true,
             "--selftest" => args.selftest = true,
             "--info" => args.info = true,
+            "--dump-session" => args.dump_session = true,
             "--grab" => args.grab = true,
             "--resume" => args.resume = true,
             "--config-dir" | "-c" => {
@@ -166,6 +171,10 @@ fn main() {
         for line in sysinfo::report(&dir, login.as_ref(), config.language) {
             println!("{line}");
         }
+        return;
+    }
+    if args.dump_session {
+        dump_session(&paths);
         return;
     }
     if args.selftest {
@@ -371,6 +380,67 @@ impl Core {
             on_off(self.lang, self.config.search),
             self.lang.code(),
         )
+    }
+}
+
+/// `--dump-session`：把「本地会话 ↔ 网页会话」的绑定情况打到 stdout。
+///
+/// 专为排查「会话名取不回来」而设，它把三件事分开说清楚：
+/// 1. 网页会话 id 到底绑上没有 —— 没绑的话，标题查询根本不会发出；
+/// 2. 按 id 查标题的结果；
+/// 3. 列表接口到底返回了什么（形状对不上时，一眼能看出来）。
+/// 输出在终端里可直接复制，不必在界面里拖选。
+fn dump_session(paths: &ConfigPaths) {
+    let Some(session) = Session::latest(&paths.sessions_dir) else {
+        println!("没有本地会话（先跑一轮对话）。");
+        return;
+    };
+    println!("本地会话 id   {}", session.id);
+    println!("本地标题      {}", session.title);
+    println!(
+        "网页会话 id   {}",
+        session
+            .handle
+            .session_id
+            .clone()
+            .unwrap_or_else(|| "（空 —— 标题查询不会发出）".to_string())
+    );
+    println!(
+        "父消息 id     {}",
+        session
+            .handle
+            .parent_message_id
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "（空）".to_string())
+    );
+    if let Some(id) = &session.handle.session_id {
+        println!("会话链接      https://chat.deepseek.com/a/chat/s/{id}");
+    }
+
+    let Some(auth) = auth::load_auth(paths) else {
+        println!("\n未登录，无法查接口。");
+        return;
+    };
+    let config = config::load_config(paths);
+    let client = match DeepSeekClient::new(&config) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("\n客户端初始化失败：{e}");
+            return;
+        }
+    };
+
+    if let Some(id) = &session.handle.session_id {
+        match client.session_title(&auth.token, id) {
+            Some(t) => println!("\n按 id 查到的标题：{t}"),
+            None => println!("\n按 id 查标题：没取到（见下面的原始返回）"),
+        }
+    }
+
+    println!("\n/chat_session/fetch_page 原始返回：");
+    match client.session_list_raw(&auth.token, 20000) {
+        Some(raw) => println!("{raw}"),
+        None => println!("（请求失败：网络或凭证问题，可先跑 --selftest 看看）"),
     }
 }
 
@@ -888,7 +958,7 @@ fn command(
                     None => app.line_styled("  未登录，无法查询。", ui::warn()),
                     Some(token) => match core.client() {
                         Err(e) => app.line_styled(format!("  {e}"), ui::err()),
-                        Ok(client) => match client.session_list_raw(&token) {
+                        Ok(client) => match client.session_list_raw(&token, 1500) {
                             Some(raw) => {
                                 app.line_styled(
                                     "  /chat_session/fetch_page 原始返回（截断）：",
