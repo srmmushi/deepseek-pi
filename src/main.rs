@@ -630,6 +630,11 @@ fn event_loop(
             clipboard::copy(&text);
         }
 
+        // 点击了带网址的行（联网搜索的来源清单）→ 用系统浏览器打开
+        if let Some(url) = app.take_open() {
+            open_in_browser(core, app, &url);
+        }
+
         // 交互式登录：App 只负责「要一次输入」，多步流程靠 login_stage 串起来
         if let Some(text) = app.take_login_input() {
             match core.login_stage {
@@ -836,28 +841,7 @@ fn command(
             } else {
                 arg.clone()
             };
-            let list = sysinfo::detect_browsers();
-            let in_wsl = sysinfo::wsl_version().is_some();
-            match sysinfo::resolve(&list, &core.config.browser) {
-                Some(i) => match sysinfo::open_url(&list[i], &url, false) {
-                    Ok(()) => app.line_styled(
-                        format!(
-                            "已用 {} 打开 {url}",
-                            sysinfo::describe(&list[i], in_wsl, lang)
-                        ),
-                        ui::ok(),
-                    ),
-                    Err(e) => app.line_styled(format!("打开浏览器失败：{e}"), ui::err()),
-                },
-                None => app.line_styled(
-                    if lang == Lang::Zh {
-                        "没有可用浏览器，输入 /info 看看环境。"
-                    } else {
-                        "No browser available; run /info."
-                    },
-                    ui::warn(),
-                ),
-            }
+            open_in_browser(core, app, &url);
         }
         "/quit" | "/exit" => app.quit = true,
         "/clear" => {
@@ -1424,6 +1408,36 @@ fn export_markdown(session: &Session, path: &std::path::Path) -> std::io::Result
         out.push_str(&format!("## {who}\n\n{content}\n\n"));
     }
     std::fs::write(path, out)
+}
+
+/// 用选定的浏览器打开一个网址。
+///
+/// 抽出来是因为有两条路径：`/open` 命令，以及**点击界面里带网址的行**
+/// （联网搜索的来源清单）。用哪个浏览器沿用 `/browser` 的选择。
+fn open_in_browser(core: &mut Core, app: &mut App, url: &str) {
+    let lang = core.lang;
+    let list = sysinfo::detect_browsers();
+    let in_wsl = sysinfo::wsl_version().is_some();
+    match sysinfo::resolve(&list, &core.config.browser) {
+        Some(i) => match sysinfo::open_url(&list[i], url, false) {
+            Ok(()) => app.line_styled(
+                format!(
+                    "已用 {} 打开 {url}",
+                    sysinfo::describe(&list[i], in_wsl, lang)
+                ),
+                ui::ok(),
+            ),
+            Err(e) => app.line_styled(format!("打开浏览器失败：{e}"), ui::err()),
+        },
+        None => app.line_styled(
+            if lang == Lang::Zh {
+                "没有可用浏览器，输入 /info 看看环境。"
+            } else {
+                "No browser available; run /info."
+            },
+            ui::warn(),
+        ),
+    }
 }
 
 /// 落地一个开关。

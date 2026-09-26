@@ -205,6 +205,38 @@ GET  open.weixin.qq.com/connect/qrcode/<编号>      ← 微信直接返回二�
 `/goto` 弹出提示词选择框（↑/↓ 选、Enter 跳转），`/goto 3` 直接跳第 3 条。
 `/system-prompt` 看当前提示词，`edit` 用 `$EDITOR` 打开，`reset` 恢复默认。
 
+## 联网搜索与引用
+
+`Ctrl+S`（状态栏那个开关）打开后，模型会自己决定要不要联网。搜索**不是**一个工具调用 ——
+它由服务端完成，客户端只负责把结果展示出来。响应里是这么走的（实测抓下来的）：
+
+```text
+① 先出一个 type=SEARCH 的片段，带 queries（搜了什么）
+② 再用补丁 response/fragments/-1/results 下发来源数组：
+   [{url, title, snippet, cite_index, site_name, site_icon, query_indexes}, …]
+③ 片段自身补上 content = "搜索到 6 个网页"
+④ 正文里出现 [citation:1] [citation:2] 这类引用标记，数字对应 cite_index
+```
+
+于是终端里呈现为：
+
+```text
+▌ search-web  搜索到 6 个网页 · 点击或 Ctrl+O 展开
+    [1] 2026年9月26日
+        http://www.joyurl.cn/calendar/date_2026_9_26.html
+    [2] 今日是什么日子
+        https://huangli.txcx.com/jintian-shenmerizi.html
+```
+
+- 折叠块默认收起，`Ctrl+O` 或点块头展开
+- **点带网址的行 → 用系统浏览器打开**（选哪个浏览器沿用 `/browser`；终端里没有"应用内浏览器"，
+  所以点链接一律是外部打开）
+- 正文里的 `[citation:3]` 显示成 `[3]` —— 只改显示，**送回模型的仍是原文**
+- 不是每次问答都会搜（`search_triggered` 为假时没有结果块），没搜就不显示，不留空壳
+
+识别用的是「路径以 `/results` 结尾」+「确实是含 `url` 的对象数组」双重判断，
+形状变了最坏只是不显示，不会把别的东西当来源。
+
 ## 会话存储
 
 每个会话一个目录，正文是一份可直接翻看的 Markdown：

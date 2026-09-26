@@ -104,6 +104,46 @@ pub enum DoubleAction {
 /// 连按两下的有效窗口
 const DOUBLE_WINDOW: std::time::Duration = std::time::Duration::from_millis(2500);
 
+/// 从一行文本里找出第一个 http(s) 网址（收起行尾的标点）
+fn find_url(text: &str) -> Option<String> {
+    let at = text.find("http://").or_else(|| text.find("https://"))?;
+    let rest = &text[at..];
+    let end = rest
+        .find(|c: char| c.is_whitespace() || matches!(c, ')' | '）' | '，' | '、' | ']'))
+        .unwrap_or(rest.len());
+    let url = rest[..end]
+        .trim_end_matches(['.', ',', ';', '。', '，'])
+        .to_string();
+    (!url.is_empty()).then_some(url)
+}
+
+/// 把正文里的 `[citation:3]` 压成 `[3]`。
+///
+/// 只用于**显示**：送回模型的内容仍是服务端原文（转换在界面这一侧做）。
+fn strip_citation(text: &str) -> String {
+    const TAG: &str = "[citation:";
+    if !text.contains(TAG) {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(TAG) {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + TAG.len()..];
+        let Some(end) = after.find(']') else {
+            // 这一块被截断在行尾，先原样留着 —— 下一行会把它补完
+            out.push_str(&rest[at..]);
+            return out;
+        };
+        out.push('[');
+        out.push_str(after[..end].trim());
+        out.push(']');
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// 扁排后的一屏行
 struct Row {
     text: String,
@@ -189,6 +229,8 @@ pub struct App {
 
     goto: Option<Goto>,
     pending: Option<String>,
+    /// 点击带网址的行 → 请求主循环用系统浏览器打开
+    open_request: Option<String>,
     pub quit: bool,
 }
 
@@ -218,6 +260,7 @@ impl Default for App {
             copied: None,
             goto: None,
             pending: None,
+            open_request: None,
             double: None,
             esc_request: false,
             quit: false,
@@ -340,7 +383,9 @@ impl App {
 
     pub fn apply(&mut self, ev: UiEvent) {
         match ev {
-            UiEvent::Line(text) => self.line(text),
+            // 正文里服务端会塞 `[citation:3]` 这样的引用标记，显示成紧凑的 [3]；
+            // 只改显示，送回模型的仍是原文（转换发生在界面这一侧）
+            UiEvent::Line(text) => self.line(strip_citation(&text)),
             UiEvent::ThinkStart => {
                 self.spinner = 0;
                 // 状态栏不再显示思考：在输出区开一个「正在思考」块，
@@ -416,6 +461,25 @@ impl App {
                     }
                     _ => self.block(head, dim(), body, true),
                 }
+            }
+            UiEvent::SearchResults { head, items } => {
+                // 联网搜索的来源折成一块：展开就是清单（标题 + 网址）
+                let mut body: Vec<String> = Vec::new();
+                for it in &items {
+                    let name = if it.title.trim().is_empty() {
+                        it.site_name.as_str()
+                    } else {
+                        it.title.as_str()
+                    };
+                    body.push(format!("  [{}] {name}", it.cite_index));
+                    body.push(format!("       {}", it.url));
+                }
+                self.block(
+                    format!("▌ search-web  {head} · 点击或 Ctrl+O 展开"),
+                    dim(),
+                    body,
+                    true,
+                );
             }
             UiEvent::ToolBatchStart(calls) => {
                 self.line("");
@@ -747,8 +811,11 @@ impl App {
                     self.dragging = false;
                     return;
                 }
-                // 没拖动就是单击，折叠对应的块
-                self.click_fold(origin.row);
+                // 没拖动就是单击：行里带网址就先开网页（来源清单那几行），
+                // 否则照旧折叠对应的块
+                if !self.open_url_at(origin.row) {
+                    self.click_fold(origin.row);
+                }
             }
             MouseEventKind::Down(MouseButton::Right) => self.copy_or_clear_selection(),
             _ => {}
@@ -776,6 +843,26 @@ impl App {
                 item.collapsed = !item.collapsed;
             }
         }
+    }
+
+    /// 点击的行里带 http(s) 网址就记下打开请求（返回 true）。
+    ///
+    /// 终端里没有「应用内浏览器」，所以点链接一律是**用系统浏览器打开**，
+    /// 用哪个浏览器沿用 `/browser` 的选择。主循环负责真正调用。
+    fn open_url_at(&mut self, row: usize) -> bool {
+        let Some(text) = self.rows.get(row).map(|r| r.text.clone()) else {
+            return false;
+        };
+        let Some(url) = find_url(&text) else {
+            return false;
+        };
+        self.open_request = Some(url);
+        true
+    }
+
+    /// 取走一次「打开网页」请求
+    pub fn take_open(&mut self) -> Option<String> {
+        self.open_request.take()
     }
 
     fn copy_or_clear_selection(&mut self) {

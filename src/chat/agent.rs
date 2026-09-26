@@ -32,6 +32,12 @@ pub enum UiEvent {
     ThinkProgress { delta: String },
     /// 思考结束（带上全文，供展开回放）
     ThinkEnd { text: String, ms: u128 },
+    /// 联网搜索的来源：界面折成一块「搜索到 N 个网页」，
+    /// 展开是来源列表（标题 + 网址），点网址行还能直接打开。
+    SearchResults {
+        head: String,
+        items: Vec<crate::stream::SearchItem>,
+    },
     /// 工具批次开始：调用一次性列出
     ToolBatchStart(Vec<String>),
     /// 单个工具结束
@@ -428,6 +434,13 @@ pub fn run_turn(
                             drop(acc);
                             let _ = tx_cb.send(UiEvent::ThinkEnd { text, ms });
                         }
+                    }
+                    StreamEvent::SearchResults { items } => {
+                        let head = match lang {
+                            Lang::Zh => format!("搜索到 {} 个网页", items.len()),
+                            Lang::En => format!("{} sources found", items.len()),
+                        };
+                        let _ = tx_cb.send(UiEvent::SearchResults { head, items });
                     }
                     StreamEvent::ContentDelta(text) => {
                         acc.assistant.push_str(&text);

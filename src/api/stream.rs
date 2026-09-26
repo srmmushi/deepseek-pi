@@ -5,6 +5,17 @@
 
 use serde_json::Value;
 
+/// 一条联网搜索来源
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchItem {
+    pub url: String,
+    pub title: String,
+    /// 站点名（标题为空时用它兜底，比裸 URL 好看）
+    pub site_name: String,
+    /// 与正文里 `[citation:N]` 对应的编号
+    pub cite_index: u32,
+}
+
 /// 精简后的流事件
 #[derive(Debug, Clone, PartialEq)]
 pub enum StreamEvent {
@@ -12,6 +23,12 @@ pub enum StreamEvent {
     ThinkDelta(String),
     ContentStart,
     ContentDelta(String),
+    /// 联网搜索的来源列表。
+    ///
+    /// 服务端会先下发一个 `type: SEARCH` 的片段，随后用
+    /// `response/fragments/-1/results` 这个补丁把来源数组补上；
+    /// 不是每次搜索都会有（`search_triggered` 为假时就没有）。
+    SearchResults { items: Vec<SearchItem> },
     Done {
         finish_reason: Option<String>,
         usage: Option<u64>,
@@ -113,6 +130,15 @@ impl PatchState {
         if self.current_path.is_none() {
             if let Some(response) = v.get("response").filter(|r| r.is_object()) {
                 return self.apply_initial_snapshot(response);
+            }
+        }
+
+        // 联网搜索的来源列表。放在 BATCH 判断之前：它通常是单独一条下发，
+        // 但若哪天带上 BATCH 标记，走 BATCH 分支会被当成普通补丁数组漏掉。
+        // 判据是「路径以 /results 结尾」+「确实是含 url 的对象数组」。
+        if path.ends_with("/results") {
+            if let Some(items) = parse_search_items(v) {
+                return vec![StreamEvent::SearchResults { items }];
             }
         }
 
@@ -279,6 +305,36 @@ impl PatchState {
     fn flush(&mut self) -> Vec<StreamEvent> {
         self.finalize(vec![])
     }
+}
+
+/// 从补丁里取出搜索来源。形状不认识就返回 None ——
+/// 宁可少显示，也不要把无关的数组当成来源列出来。
+fn parse_search_items(val: &Value) -> Option<Vec<SearchItem>> {
+    let items: Vec<SearchItem> = val
+        .as_array()?
+        .iter()
+        .filter_map(|it| {
+            let url = it.get("url").and_then(|v| v.as_str())?.to_string();
+            Some(SearchItem {
+                url,
+                title: it
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                site_name: it
+                    .get("site_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                cite_index: it
+                    .get("cite_index")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32,
+            })
+        })
+        .collect();
+    (!items.is_empty()).then_some(items)
 }
 
 fn delta_for(frag_type: &str, content: &str) -> Vec<StreamEvent> {
