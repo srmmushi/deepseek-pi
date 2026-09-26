@@ -528,6 +528,32 @@ impl DeepSeekClient {
     ///
     /// 接口形状不明时用它 —— 能看到服务端到底回了什么，
     /// 而不是只得到一个「失败」。
+    /// 原始 GET：(状态码, 响应体)。
+    ///
+    /// 会话列表一类接口是 **GET** —— 用 POST 打它只会拿到 405，
+    /// 而错误被吞掉之后就只表现为「取不到数据」，很难查。
+    fn raw_get(
+        &self,
+        path: &str,
+        token: &str,
+        query: &[(&str, &str)],
+    ) -> Result<(u16, String), DsError> {
+        self.throttle();
+        let mut req = self
+            .http
+            .get(self.url(path))
+            .headers(self.build_headers(Some(token), None, false));
+        if !query.is_empty() {
+            req = req.query(query);
+        }
+        let res = req
+            .send()
+            .map_err(|e| DsError::Other(format!("请求没发出去：{e}")))?;
+        let status = res.status().as_u16();
+        let text = res.text().unwrap_or_default();
+        Ok((status, text))
+    }
+
     fn raw_post(&self, path: &str, token: &str, body: &Value) -> Result<(u16, String), DsError> {
         self.throttle();
         let res = self
@@ -544,12 +570,15 @@ impl DeepSeekClient {
 
     /// 请求会话列表接口，把响应体解析成 JSON。
     ///
-    /// 走 `raw_post` 而**不套信封解包**：聊天接口那套信封（code/data/biz_data）
-    /// 并不适用于它 —— 之前用 `post_json` 取标题一直失败，很可能就栽在这里。
-    /// 返回的 JSON 交给 `session_list` 去宽容地找列表，两种形状都能吃。
-    fn session_page(&self, token: &str, body: Value) -> Result<Value, String> {
+    /// 两个要点，都是踩过坑才定的：
+    /// 1. **这是 GET，不是 POST** —— 隔壁 `/chat_session/delete`、`/update_title`
+    ///    是 POST，唯独 `fetch_page` 是 GET。用 POST 打它只会拿到 405，
+    ///    表现就是标题永远取不回来。
+    /// 2. **不套信封解包** —— 聊天接口那套 `{code, data:{biz_data}}` 不适用于它；
+    ///    拿到 JSON 后交给 `session_list` 宽容地找列表，包不包都能吃。
+    fn session_page(&self, token: &str, query: &[(&str, &str)]) -> Result<Value, String> {
         let (status, text) = self
-            .raw_post(EP_SESSION_PAGE, token, &body)
+            .raw_get(EP_SESSION_PAGE, token, query)
             .map_err(|e| e.to_string())?;
         if !(200..300).contains(&status) {
             return Err(format!("HTTP {status}：{}", head_of(&text, 200)));
@@ -747,15 +776,15 @@ impl DeepSeekClient {
     /// 比我们按提示词截断出来的好看。接口形状若变动，这里返回 None，
     /// 调用方继续用本地标题，不影响任何功能。
     pub fn session_title(&self, token: &str, session_id: &str) -> Option<String> {
-        let data = self.session_page(token, json!({ "count": 50 })).ok()?;
+        let data = self.session_page(token, &[("count", "50")]).ok()?;
         if let Some(list) = session_list(&data) {
             if let Some(title) = pick_title(list, session_id) {
                 return Some(title);
             }
         }
-        // 有些版本支持直接按 id 查，再试一次
+        // 不在第一页时（或接口支持按 id 过滤时）再试一次
         let data = self
-            .session_page(token, json!({ "count": 1, "chat_session_id": session_id }))
+            .session_page(token, &[("count", "1"), ("chat_session_id", session_id)])
             .ok()?;
         let list = session_list(&data)?;
         list.first()
@@ -769,7 +798,7 @@ impl DeepSeekClient {
     /// `/session debug` 与 `--dump-session` 打印它 ——
     /// 接口形状对不上时，一眼看出服务端到底回了什么，不必再猜。
     pub fn session_list_raw(&self, token: &str, max_chars: usize) -> String {
-        match self.raw_post(EP_SESSION_PAGE, token, &json!({ "count": 50 })) {
+        match self.raw_get(EP_SESSION_PAGE, token, &[("count", "50")]) {
             Err(e) => format!("请求没发出去：{e}"),
             Ok((status, body)) => {
                 let total = body.chars().count();
