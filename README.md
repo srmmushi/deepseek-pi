@@ -177,7 +177,7 @@ GET  open.weixin.qq.com/connect/qrcode/<编号>      ← 微信直接返回二�
 
 ```text
 环境信息
-  程序版本    dsp 0.2.1 (release)
+  程序版本    dsp 1.0.0 (release)
   操作系统    Ubuntu 24.04.1 LTS
   构建号      5fdd0af
   内核        Linux 5.15.167.4-microsoft-standard-WSL2
