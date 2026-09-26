@@ -279,6 +279,12 @@ struct Core {
     last_rate: Option<f64>,
     /// /logout 丢掉的那份凭证。浏览器存储里可能还留着，重新登录时要忽略它
     discarded: Option<String>,
+    /// 本会话用的系统提示词全文，连同对应的会话 id 一起存。
+    ///
+    /// 会话内**刻意冻结**：这段文本是请求的最前面，服务端的上下文缓存按前缀逐字节命中，
+    /// 中途改动会让整段缓存作废（而且 Reuse 模式下首轮就定下来了，改了也不会重新下发）。
+    /// 换会话时 id 变了，自动重建。
+    system_text_cache: Option<(String, String)>,
 }
 
 impl Core {
@@ -299,9 +305,18 @@ impl Core {
         Ok(self.client.clone().unwrap())
     }
 
-    fn system_text(&self) -> String {
+    /// 系统提示词 + 工具说明。同一会话内保持不变（见字段注释）。
+    fn system_text(&mut self) -> String {
+        let session_id = self.session.lock().unwrap().id.clone();
+        if let Some((cached, text)) = &self.system_text_cache {
+            if *cached == session_id {
+                return text.clone();
+            }
+        }
         let prompt = prompt::load_system_prompt(&self.paths, self.lang);
-        agent::build_system_text(&prompt, self.lang)
+        let text = agent::build_system_text(&prompt, self.lang);
+        self.system_text_cache = Some((session_id, text.clone()));
+        text
     }
 
     fn save_session(&self) {
@@ -386,6 +401,7 @@ fn run(paths: ConfigPaths, resume: bool) -> anyhow::Result<()> {
         solver: Arc::new(Mutex::new(None)),
         aborted: Arc::new(Mutex::new(false)),
         pending_editor: false,
+        system_text_cache: None,
         paths,
         login_stage: STAGE_NONE,
         login_account: String::new(),
@@ -882,7 +898,10 @@ fn command(
             "reset" => {
                 let lang = core.lang;
                 match prompt::reset_system_prompt(&core.paths, lang) {
-                    Ok(()) => app.line_styled("已恢复默认系统提示词。", ui::ok()),
+                    Ok(()) => app.line_styled(
+                        "已恢复默认系统提示词。当前会话的开头保持不变（这样能命中服务端上下文缓存），/new 开新会话后生效。",
+                        ui::ok(),
+                    ),
                     Err(e) => app.line_styled(format!("重置失败：{e}"), ui::err()),
                 }
             }
