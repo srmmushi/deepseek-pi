@@ -1,6 +1,6 @@
 [package]
 name = "dsp"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 description = "DSP (deepseek-pi) —— Rust + Ratatui 终端编程助手，仅使用 DeepSeek 网页版"
 license = "MIT"
