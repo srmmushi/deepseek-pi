@@ -221,6 +221,55 @@ fn build_call(name: &str, rest: &str) -> Result<ToolCall, String> {
     }
 }
 
+/// 剥掉一行两端那些「装饰性」的 markdown / 列表符号：
+/// `- ` `* ` `+ ` `> ` `1. ` 这类列表与编号，以及包在工具名外面的 `**` `_` `` ` `` `#`。
+///
+/// 模型很爱把调用写成 `- read:src/x.rs` 或 `` `read:x` ``。那都是明确的调用意图，
+/// 判成「没命中」就是白丢一轮；而清理只动这些装饰字符，参数本身一个字节都不碰。
+fn strip_markup(line: &str) -> &str {
+    let mut s = line.trim();
+    loop {
+        let before = s;
+        if let Some(rest) = s.strip_prefix('>') {
+            s = rest.trim_start();
+        }
+        for p in ["- ", "* ", "+ ", "• "] {
+            if let Some(rest) = s.strip_prefix(p) {
+                s = rest.trim_start();
+            }
+        }
+        // `1. ` / `1) ` 这类编号
+        let digits = s.len() - s.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        if digits > 0 {
+            let rest = s[digits..].trim_start();
+            if let Some(r) = rest.strip_prefix('.').or_else(|| rest.strip_prefix(')')) {
+                if r.starts_with(char::is_whitespace) {
+                    s = r.trim_start();
+                }
+            }
+        }
+        s = s.trim_start_matches(['*', '_', '`', '#', ' ']);
+        if s == before {
+            return s;
+        }
+    }
+}
+
+/// 这一行是不是一个工具调用的开头？是则给出小写的工具名。
+///
+/// 工具名上的强调符号在这里一并剥掉（`**read**:x` 也算 `read`）。
+fn call_head(line: &str) -> Option<String> {
+    let s = strip_markup(line);
+    let colon = s.find([':', '：'])?;
+    let head: String = s[..colon]
+        .chars()
+        .filter(|c| !matches!(*c, '*' | '_' | '`'))
+        .collect();
+    let head = head.trim().to_ascii_lowercase();
+    ToolName::parse(&head)?;
+    Some(head)
+}
+
 /// 从 assistant 文本中解析全部工具调用（只识别单独成行的调用，忽略代码围栏）
 ///
 /// `write` 的正文允许跨多行 —— 写文件时内容本来就有换行，如果只认单行，
@@ -231,44 +280,41 @@ pub fn parse_tool_calls(text: &str) -> ParseResult {
     let lines: Vec<&str> = text.lines().collect();
     let mut i = 0;
     while i < lines.len() {
-        let line = lines[i].trim();
+        // 先剥掉列表符号与强调符号：`- read:x`、`` `read:x` ``、`**read**:x` 都算调用
+        let line = strip_markup(lines[i]);
         if line.is_empty() || line.starts_with("```") {
             i += 1;
             continue;
         }
-        let lower = line.to_ascii_lowercase();
-        let Some(colon) = lower.find([':', '：']) else {
+        let Some(head) = call_head(line) else {
             i += 1;
             continue;
         };
-        let head = &lower[..colon];
-        if ToolName::parse(head).is_none() {
-            i += 1;
-            continue;
-        }
+        let colon = line.find([':', '：']).unwrap_or(0);
         // 用原串切片，保留大小写与内容
         let offset = colon + line[colon..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
-        let mut body = line[offset..].trim().to_string();
+        // 参数末尾的反引号 / 句号是模型顺手带上的装饰，不算参数本身
+        let mut body = line[offset..]
+            .trim()
+            .trim_end_matches(['`', '。'])
+            .trim_end()
+            .to_string();
         let start_line = i + 1;
 
-        let mut call = build_call(head, &body);
+        let mut call = build_call(&head, &body);
         if head == "write" {
             let mut used = 0;
             while call.is_err() && i + 1 < lines.len() && used < 2000 {
-                let next = lines[i + 1].trim();
+                let next = strip_markup(lines[i + 1]);
                 // 撞上另一个工具调用，说明已经吃过头了
-                if next
-                    .split([':', '：'])
-                    .next()
-                    .is_some_and(|h| ToolName::parse(h.trim()).is_some())
-                {
+                if call_head(next).is_some() {
                     break;
                 }
                 i += 1;
                 used += 1;
                 body.push('\n');
                 body.push_str(lines[i]);
-                call = build_call(head, &body);
+                call = build_call(&head, &body);
             }
         }
 
@@ -279,6 +325,60 @@ pub fn parse_tool_calls(text: &str) -> ParseResult {
         i += 1;
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn calls(text: &str) -> Vec<ToolCall> {
+        parse_tool_calls(text).calls
+    }
+
+    #[test]
+    fn plain_calls() {
+        assert_eq!(calls("read:src/a.rs").len(), 1);
+        assert_eq!(calls("list:src").len(), 1);
+        assert_eq!(calls("search:foo").len(), 1);
+    }
+
+    /// 模型最爱的几种装饰写法：列表符号、加粗、反引号、编号
+    #[test]
+    fn tolerates_markup_around_the_call() {
+        assert_eq!(calls("- read:src/a.rs").len(), 1);
+        assert_eq!(calls("* read:src/a.rs").len(), 1);
+        assert_eq!(calls("**read**:src/a.rs").len(), 1);
+        assert_eq!(calls("`read:src/a.rs`").len(), 1);
+        assert_eq!(calls("1. read:src/a.rs").len(), 1);
+        assert_eq!(calls("> read:src/a.rs").len(), 1);
+    }
+
+    #[test]
+    fn tolerates_spacing_case_and_fullwidth_colon() {
+        assert_eq!(calls("read : src/a.rs").len(), 1);
+        assert_eq!(calls("read：src/a.rs").len(), 1);
+        assert_eq!(calls("READ:src/a.rs").len(), 1);
+    }
+
+    #[test]
+    fn multi_line_write_keeps_its_content() {
+        let got = calls("write:\"line1\nline2\n\",src/a.txt");
+        assert_eq!(got.len(), 1);
+        match &got[0] {
+            ToolCall::Write { content, path } => {
+                assert_eq!(content.as_str(), "line1\nline2\n");
+                assert_eq!(path.as_str(), "src/a.txt");
+            }
+            other => panic!("期望 write，实际 {other:?}"),
+        }
+    }
+
+    /// 夹在说明文字里的「调用」不算调用 —— 否则会误执行用户没要求的事
+    #[test]
+    fn prose_is_not_a_call() {
+        assert!(calls("我先 read:src/a.rs 看看").is_empty());
+        assert!(calls("这不是一个调用").is_empty());
+    }
 }
 
 /// 工具调用的参数摘要（界面展示用）

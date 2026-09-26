@@ -105,13 +105,32 @@ GET  open.weixin.qq.com/connect/qrcode/<编号>      ← 微信直接返回二�
 
 > `/login passwd` 用的 `/api/v0/users/login` 有第三方项目佐证，比上面的换 token 那步可靠。
 
+## 提示词与工具调用格式
+
+两层分工：`system-prompt.md` 你可以随便改，工具格式那层碰不到 ——
+
+| 层 | 内容 | 位置 |
+|----|------|------|
+| 系统提示词 | 角色、工具选择、干活纪律、准确性、输出规范 | `system-prompt.md`（可编辑，`/system-prompt` 查看） |
+| 工具说明 | 五个工具的调用格式、正反例、并行规则 | 每次请求注入，不落盘 |
+
+格式是硬约束，所以正反例写全了。模型最常失手的地方是给调用「加装饰」：
+列表符号、加粗、反引号、缺冒号、把说明写在调用同一行。
+
+解析器对这些装饰**做了容错**（`- read:x`、`**read**:x`、反引号包住、`READ:x`、
+全角冒号 `read：x`、`read : x` 这种空格都认）—— 判成「没命中」等于白丢一轮。
+但夹在说明文字里的 `read:x` 不算调用：那多半只是在描述，误执行更糟。
+
+解析失败时错误会**回灌给模型**（附正确格式与常见错法），它下一轮能自己改对；
+同一批里只要有别的调用成功，失败的那几个也会单独说明，不会让模型以为全都跑了。
+
 ## 快捷键
 
 | 按键 | 作用 |
 |------|------|
 | `Enter` | 发送 |
-| `Esc` | 退出；有选区时先取消选区；登录输入中则取消登录 |
-| `Ctrl+C` | 中断生成；有选区时改为「复制选区」 |
+| `Esc` ×2 | 停止本轮（等待第二下时状态栏会提示）；单次按下：有选区先清选区、登录输入中则取消登录 |
+| `Ctrl+C` ×2 | 退出程序（等待第二下时状态栏会提示）；有选区时改为「复制选区」 |
 | `右键` | 复制选区 |
 | `Ctrl+T` / `Ctrl+S` | 深度思考 / 智能搜索（状态栏常驻显示当前值） |
 | `Ctrl+O` | 展开或收起最近一个块（思考、exec 输出） |
@@ -123,9 +142,8 @@ GET  open.weixin.qq.com/connect/qrcode/<编号>      ← 微信直接返回二�
 ## 命令
 
 ```
-/help /login /logout /thinking /search /thinking-view /model /lang
-/status /sessions /session /clear /goto /system-prompt
-/info /open /quit
+/help /login /logout /new /session /clear /goto /thinking /search
+/model /lang /status /info /open /export /system-prompt /quit
 ```
 
 ### 环境与浏览器
@@ -134,7 +152,7 @@ GET  open.weixin.qq.com/connect/qrcode/<编号>      ← 微信直接返回二�
 
 ```text
 环境信息
-  程序版本    dsp 0.1.0 (release)
+  程序版本    dsp 0.2.1 (release)
   操作系统    Ubuntu 24.04.1 LTS
   构建号      5fdd0af
   内核        Linux 5.15.167.4-microsoft-standard-WSL2
@@ -154,7 +172,7 @@ GET  open.weixin.qq.com/connect/qrcode/<编号>      ← 微信直接返回二�
 ```text
 ❯ !git status --short
   ▌ git status --short
-   M src/ui.rs
+   M src/tui/app.rs
   └ exit 0  0.8s
 ```
 
@@ -168,7 +186,8 @@ GET  open.weixin.qq.com/connect/qrcode/<编号>      ← 微信直接返回二�
 - **思考折叠**：默认只占一行，`Ctrl+O` 展开回放全文。思考块**一定排在正文上面** ——
   正文是按行实时推给界面的，所以思考在「正文开始的那一刻」就收尾。
 - **不发 tokio**：`reqwest::blocking` + 一个后台线程 + `mpsc`，界面线程只管画。
-- **身份**：系统提示词里的身份是 `Pi-Agent`；被问到「你是谁 / 叫什么」时统一回答 `deepseek`。
+- **身份**：系统提示词把「Pi-Agent」定位成**程序代号**，你的名字是 `DeepSeek` ——
+  自我介绍或被问「你是谁 / 什么模型」时统一回答 `我是 DeepSeek`，不提其他名称。
 - **会话名**：首条提示词回车即作为标题顶掉「新会话」，首轮结束后再向网页端取它自动起的名字覆盖。
 
 ## 已知限制

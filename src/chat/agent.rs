@@ -433,12 +433,11 @@ pub fn run_turn(
 
         let parsed = parse_tool_calls(&assistant_text);
 
-        // 解析出错：回灌错误让模型自我修正
+        // 解析出错：回灌错误让模型自我修正。
+        // 提示里必须带上「正确格式长什么样」—— 只说一句「解析失败」，
+        // 模型下一轮常常会照着原来的错法再写一遍。
         if parsed.calls.is_empty() && !parsed.errors.is_empty() {
-            let error_text = format!(
-                "{result_prefix}\n[tool-call parse error]\n{}",
-                parsed.errors.join("\n")
-            );
+            let error_text = format!("{result_prefix}\n{}", parse_error_hint(lang, &parsed.errors));
             session
                 .messages
                 .push(("tool".to_string(), error_text.clone()));
@@ -493,6 +492,13 @@ pub fn run_turn(
             )));
         }
 
+        // 部分调用没解析出来时，也把原因一并回灌 ——
+        // 否则模型会以为它们都执行了，然后拿着不存在的结果继续往下编。
+        if !parsed.errors.is_empty() {
+            let hint = parse_error_hint(lang, &parsed.errors);
+            session.messages.push(("tool".to_string(), hint.clone()));
+            blocks.push(hint);
+        }
         outgoing = blocks.join("\n\n");
         steps += 1;
         if steps >= max_steps {
@@ -519,6 +525,27 @@ pub fn run_turn(
         gen_ms,
     });
     let _ = tx.send(UiEvent::Finished);
+}
+
+/// 把解析错误组织成「模型看得懂、能照着改」的一段话。
+///
+/// 光说「解析失败」没用 —— 回灌里必须写清正确格式和最常见的几种错法，
+/// 模型才能在下一轮里自己改对，而不是把同一个错误再写一遍。
+fn parse_error_hint(lang: Lang, errors: &[String]) -> String {
+    let head = match lang {
+        Lang::Zh => {
+            "以下调用没有被识别，也就没有执行。格式必须是「工具名:参数」并且独占一行：\n  \
+             read:路径    list:目录    search:关键词    exec:命令    write:\"内容\",路径\n  \
+             不要加 - * 1. 这类列表符号，不要加粗或用反引号包住，调用行里不要夹带说明文字。"
+        }
+        Lang::En => {
+            "These calls were not recognized and did not run. A call must be `tool:argument` \
+             on a line of its own:\n  \
+             read:path    list:dir    search:keyword    exec:command    write:\"body\",path\n  \
+             No bullets or numbering, no bold, no backticks, and no prose on the call line."
+        }
+    };
+    format!("{head}\n\n{}", errors.join("\n"))
 }
 
 /// 并行执行一批工具，返回 (调用, 结果, 耗时毫秒)，顺序与传入一致
