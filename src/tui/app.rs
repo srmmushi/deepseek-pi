@@ -367,11 +367,13 @@ impl App {
                 };
                 live.text.push_str(&delta);
                 let at = live.at;
+                let secs = live.started.elapsed().as_secs_f32().max(0.2);
+                let chars = live.text.chars().count();
+                // 带上思考速度：数字停住不动就说明卡住了，比光看字数直观
                 let head = format!(
-                    "▌ {} 正在思考 {:.1}s · {} 字 · 点击或 Ctrl+O 展开",
+                    "▌ {} 正在思考 {secs:.1}s · {chars} 字 · {:.0} 字/s · 点击或 Ctrl+O 展开",
                     SPINNER[self.spinner % SPINNER.len()],
-                    live.started.elapsed().as_secs_f32(),
-                    live.text.chars().count()
+                    chars as f32 / secs,
                 );
                 let body: Vec<String> = live.text.lines().map(|l| format!("    {l}")).collect();
                 if let Some(item) = self.items.get_mut(at) {
@@ -391,7 +393,15 @@ impl App {
                     return;
                 }
                 let chars = text.chars().count();
-                let head = format!("▌ 思考 {} · {chars} 字 · 点击或 Ctrl+O 展开", format_ms(ms));
+                let cps = if ms > 0 {
+                    format!(" · {:.0} 字/s", chars as f64 * 1000.0 / ms as f64)
+                } else {
+                    String::new()
+                };
+                let head = format!(
+                    "▌ 思考 {} · {chars} 字{cps} · 点击或 Ctrl+O 展开",
+                    format_ms(ms)
+                );
                 let body = text
                     .lines()
                     .filter(|l| !l.trim().is_empty())

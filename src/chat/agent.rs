@@ -581,6 +581,12 @@ pub fn run_turn(
             break;
         }
 
+        // 用户已经按了停止：这一批工具就别再动手了
+        if *runtime.aborted.lock().unwrap() {
+            let _ = tx.send(UiEvent::Notice(tr(lang, "repl.stopped").to_string()));
+            break;
+        }
+
         // 并行执行本批工具
         let calls = parsed.calls.clone();
         let _ = tx.send(UiEvent::ToolBatchStart(

@@ -431,6 +431,19 @@ pub struct DeepSeekClient {
     config: AppConfig,
     http: HttpClient,
     last_request_at: Mutex<Option<Instant>>,
+    /// 中断标志。**与 agent 层共用同一个 Arc**（主循环建好客户端后
+    /// 用 `abort_flag()` 把它换过去）：读流的地方要能直接看到它。
+    abort: std::sync::Arc<Mutex<bool>>,
+}
+
+/// 是不是「暂时没数据」的超时，区别于真正的网络错误
+fn is_idle_timeout(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::Interrupted
+    ) || e.to_string().to_ascii_lowercase().contains("timed out")
 }
 
 impl DeepSeekClient {
@@ -445,7 +458,13 @@ impl DeepSeekClient {
             config: config.clone(),
             http: builder.build()?,
             last_request_at: Mutex::new(None),
+            abort: std::sync::Arc::new(Mutex::new(false)),
         })
+    }
+
+    /// 中断标志（与 agent 共用的那一个）
+    pub fn abort_flag(&self) -> std::sync::Arc<Mutex<bool>> {
+        self.abort.clone()
     }
 
     /// 伪造浏览器请求头
@@ -927,9 +946,19 @@ pub fn stream_chat(
         let mut buf = [0u8; 8192];
 
         loop {
-            let n = res
-                .read(&mut buf)
-                .map_err(|e| DsError::Other(format!("读取流失败：{e}")))?;
+            // 每个数据块之前先看中断标志。注意：读本身是阻塞的，
+            // 服务端长时间不发数据（深度思考中）时，这里没有机会被检查到 ——
+            // 所以「停止」在最坏情况下要等下一个数据块才真正生效。
+            if *client.abort.lock().unwrap() {
+                break;
+            }
+            let n = match res.read(&mut buf) {
+                Ok(n) => n,
+                // 读超时 = 暂时没数据（当前 reqwest 版本还没有可用的读超时接口，
+                // 留着这个分支是为了将来加上时不必再动这里）
+                Err(e) if is_idle_timeout(&e) => continue,
+                Err(e) => return Err(DsError::Other(format!("读取流失败：{e}"))),
+            };
             if n == 0 {
                 break;
             }
@@ -944,10 +973,12 @@ pub fn stream_chat(
             if !events.is_empty() {
                 saw_event = true;
             }
-            for evt in events {
-                if !on_event(evt) {
-                    break;
-                }
+            // 回调返回 false = 用户按了停止。这里必须跳出**外层**循环：
+            // 只 break 内层 for 的话，后面的数据会被一路读下去，
+            // 整段生成要等模型自己写完才结束 —— 表现就是「按了停止却停不下来」。
+            // 跳出后函数返回、res 被 drop，连接随之关闭，服务端那边也就停了。
+            if events.into_iter().any(|evt| !on_event(evt)) {
+                break;
             }
             if parser.done() {
                 finished = true;

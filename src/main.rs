@@ -303,6 +303,9 @@ impl Core {
             return Ok(c.clone());
         }
         let client = DeepSeekClient::new(&self.config).map_err(|e| e.to_string())?;
+        // 把中断标志换成客户端那一个：读流的地方要靠它轮询，
+        // 否则服务端长时间不发数据时，停止要等到下一个数据块才生效。
+        self.aborted = client.abort_flag();
         self.client = Some(Arc::new(client));
         Ok(self.client.clone().unwrap())
     }
@@ -594,6 +597,8 @@ fn event_loop(
                 // Esc 连按两下 = 停止本轮（单次 Esc 只清选区 / 取消登录）
                 if app.take_esc() && app.double_pressed(ui::DoubleAction::Stop) {
                     core.abort();
+                    // 立刻给个回执：真正松手在读流那一侧（最迟约 1 秒）
+                    app.set_status("正在停止…".to_string());
                 }
             }
             Event::Mouse(ev) => app.on_mouse(ev),
