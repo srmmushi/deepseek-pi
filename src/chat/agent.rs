@@ -479,6 +479,7 @@ pub fn run_turn(
                 true
             };
 
+            let mut tee = |_: &str| {};
             stream_chat_with_retry(
                 runtime.client.as_ref(),
                 solver,
@@ -488,6 +489,7 @@ pub fn run_turn(
                 runtime.config.thinking,
                 runtime.config.search,
                 Some(&mut session.handle),
+                &mut tee,
                 &mut on_event,
                 3,
             )

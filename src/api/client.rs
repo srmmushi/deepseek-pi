@@ -436,16 +436,6 @@ pub struct DeepSeekClient {
     abort: std::sync::Arc<Mutex<bool>>,
 }
 
-/// 是不是「暂时没数据」的超时，区别于真正的网络错误
-fn is_idle_timeout(e: &std::io::Error) -> bool {
-    matches!(
-        e.kind(),
-        std::io::ErrorKind::TimedOut
-            | std::io::ErrorKind::WouldBlock
-            | std::io::ErrorKind::Interrupted
-    ) || e.to_string().to_ascii_lowercase().contains("timed out")
-}
-
 impl DeepSeekClient {
     pub fn new(config: &AppConfig) -> Result<Self> {
         let mut builder = HttpClient::builder()
@@ -552,23 +542,20 @@ impl DeepSeekClient {
         Ok((status, text))
     }
 
-    /// 会话列表接口探针：返回 (完整 URL, 状态码与响应体)。
+    /// 请求会话列表接口，把响应体解析成 JSON。
     ///
-    /// 会话名取不回来时靠它定位：是路径不对（404）、还是要求别的鉴权（403）、
-    /// 还是形状变了（200 但字段名不同）—— 一眼能分开。
-    pub fn session_page_probe(&self, token: &str) -> (String, String) {
-        let url = self.url(EP_SESSION_PAGE);
-        match self.raw_post(EP_SESSION_PAGE, token, &json!({ "count": 50 })) {
-            Ok((status, body)) => {
-                let total = body.chars().count();
-                let mut text: String = body.chars().take(4000).collect();
-                if total > 4000 {
-                    text.push_str(&format!(" …（共 {total} 字符，已截断）"));
-                }
-                (url, format!("HTTP {status}\n{text}"))
-            }
-            Err(e) => (url, format!("请求没发出去：{e}")),
+    /// 走 `raw_post` 而**不套信封解包**：聊天接口那套信封（code/data/biz_data）
+    /// 并不适用于它 —— 之前用 `post_json` 取标题一直失败，很可能就栽在这里。
+    /// 返回的 JSON 交给 `session_list` 去宽容地找列表，两种形状都能吃。
+    fn session_page(&self, token: &str, body: Value) -> Result<Value, String> {
+        let (status, text) = self
+            .raw_post(EP_SESSION_PAGE, token, &body)
+            .map_err(|e| e.to_string())?;
+        if !(200..300).contains(&status) {
+            return Err(format!("HTTP {status}：{}", head_of(&text, 200)));
         }
+        serde_json::from_str(&text)
+            .map_err(|e| format!("响应不是 JSON（{e}）：{}", head_of(&text, 200)))
     }
 
     /// POST JSON 并解开信封，返回 biz_data
@@ -760,11 +747,7 @@ impl DeepSeekClient {
     /// 比我们按提示词截断出来的好看。接口形状若变动，这里返回 None，
     /// 调用方继续用本地标题，不影响任何功能。
     pub fn session_title(&self, token: &str, session_id: &str) -> Option<String> {
-        // 接口形状改过几次，所以这里不假设结构：列表可能叫
-        // chat_sessions / sessions，也可能再包一层 data —— 逐个试。
-        let data = self
-            .post_json(EP_SESSION_PAGE, token, &json!({ "count": 50 }))
-            .ok()?;
+        let data = self.session_page(token, json!({ "count": 50 })).ok()?;
         if let Some(list) = session_list(&data) {
             if let Some(title) = pick_title(list, session_id) {
                 return Some(title);
@@ -772,11 +755,7 @@ impl DeepSeekClient {
         }
         // 有些版本支持直接按 id 查，再试一次
         let data = self
-            .post_json(
-                EP_SESSION_PAGE,
-                token,
-                &json!({ "count": 1, "chat_session_id": session_id }),
-            )
+            .session_page(token, json!({ "count": 1, "chat_session_id": session_id }))
             .ok()?;
         let list = session_list(&data)?;
         list.first()
@@ -785,19 +764,22 @@ impl DeepSeekClient {
             .filter(|s| !s.is_empty())
     }
 
-    /// 调试用：原样返回会话列表接口的响应（按 `max_chars` 截断）。
+    /// 调试用：会话列表接口的**原始响应体**（带状态码，按 `max_chars` 截断）。
+    ///
     /// `/session debug` 与 `--dump-session` 打印它 ——
-    /// 接口形状对不上时，一眼看出实际返回了什么。
-    pub fn session_list_raw(&self, token: &str, max_chars: usize) -> Option<String> {
-        let data = self
-            .post_json(EP_SESSION_PAGE, token, &json!({ "count": 50 }))
-            .ok()?;
-        let text = serde_json::to_string(&data).ok()?;
-        let mut out: String = text.chars().take(max_chars).collect();
-        if text.chars().count() > max_chars {
-            out.push_str(" …（已截断）");
+    /// 接口形状对不上时，一眼看出服务端到底回了什么，不必再猜。
+    pub fn session_list_raw(&self, token: &str, max_chars: usize) -> String {
+        match self.raw_post(EP_SESSION_PAGE, token, &json!({ "count": 50 })) {
+            Err(e) => format!("请求没发出去：{e}"),
+            Ok((status, body)) => {
+                let total = body.chars().count();
+                let mut text: String = body.chars().take(max_chars).collect();
+                if total > max_chars {
+                    text.push_str(&format!(" …（共 {total} 字符，已截断）"));
+                }
+                format!("HTTP {status}\n{text}")
+            }
         }
-        Some(out)
     }
 
     /// 删除会话（失败静默）
@@ -886,6 +868,11 @@ impl DeepSeekClient {
 
 // ── completion 编排 ─────────────────────────────────────────
 
+/// 取前 n 个字符，用于错误信息里带上响应片段
+fn head_of(text: &str, n: usize) -> String {
+    text.chars().take(n).collect()
+}
+
 /// 会话列表可能藏在几个不同的键下面，也可能再包一层 data —— 逐个试
 fn session_list(data: &Value) -> Option<&Vec<Value>> {
     for key in [
@@ -945,6 +932,8 @@ pub fn stream_chat(
     thinking_enabled: bool,
     search_enabled: bool,
     handle: Option<&mut WebSessionHandle>,
+    /// 原始字节的旁路（`--dump-turn` 用它打印 SSE 原文）；正常路径传空闭包
+    tee: &mut dyn FnMut(&str),
     on_event: &mut dyn FnMut(StreamEvent) -> bool,
 ) -> Result<(), DsError> {
     let owned_session = handle.is_none();
@@ -1003,17 +992,14 @@ pub fn stream_chat(
             if *client.abort.lock().unwrap() {
                 break;
             }
-            let n = match res.read(&mut buf) {
-                Ok(n) => n,
-                // 读超时 = 暂时没数据（当前 reqwest 版本还没有可用的读超时接口，
-                // 留着这个分支是为了将来加上时不必再动这里）
-                Err(e) if is_idle_timeout(&e) => continue,
-                Err(e) => return Err(DsError::Other(format!("读取流失败：{e}"))),
-            };
+            let n = res
+                .read(&mut buf)
+                .map_err(|e| DsError::Other(format!("读取流失败：{e}")))?;
             if n == 0 {
                 break;
             }
             let text = String::from_utf8_lossy(&buf[..n]).to_string();
+            tee(&text);
             if message_id.is_none() && raw_head.len() < 4096 {
                 raw_head.push_str(&text);
                 message_id = crate::stream::extract_message_id(&raw_head);
@@ -1084,6 +1070,39 @@ pub fn stream_chat(
     result
 }
 
+/// `--dump-turn`：发一轮对话，把原始 SSE 原样打到 stdout。
+///
+/// 用途是「看响应里到底有什么」—— 特别是联网搜索的结果块长什么样。
+/// 它开一个全新的网页会话（不碰你正在用的那个），关掉深度思考、打开联网搜索，
+/// 所以输出短、且基本一定会带搜索结果。
+pub fn dump_turn(
+    client: &DeepSeekClient,
+    solver: &mut PowSolver,
+    token: &str,
+    prompt: &str,
+) -> Result<(), DsError> {
+    let mut handle = WebSessionHandle::default();
+    let mut tee = |chunk: &str| {
+        print!("{chunk}");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+    };
+    let mut on_event = |_evt: StreamEvent| true;
+    stream_chat_with_retry(
+        client,
+        solver,
+        token,
+        prompt,
+        "default",
+        false, // 关掉深度思考：输出短，便于看结构
+        true,  // 打开联网搜索：这正是不确定形状的那部分
+        Some(&mut handle),
+        &mut tee,
+        &mut on_event,
+        1,
+    )
+}
+
 /// 带退避重试的流式对话（仅在尚未产出任何事件时重试）
 #[allow(clippy::too_many_arguments)]
 pub fn stream_chat_with_retry(
@@ -1095,6 +1114,7 @@ pub fn stream_chat_with_retry(
     thinking_enabled: bool,
     search_enabled: bool,
     handle: Option<&mut WebSessionHandle>,
+    tee: &mut dyn FnMut(&str),
     on_event: &mut dyn FnMut(StreamEvent) -> bool,
     max_attempts: usize,
 ) -> Result<(), DsError> {
@@ -1117,6 +1137,7 @@ pub fn stream_chat_with_retry(
                 thinking_enabled,
                 search_enabled,
                 handle.as_deref_mut(),
+                &mut *tee,
                 &mut wrapper,
             );
             match result {

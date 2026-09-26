@@ -43,7 +43,9 @@ DSP (deepseek-pi) —— 终端编程助手，仅使用 DeepSeek 网页版
       --selftest            只做自检：打印机器指纹并尝试解密已保存的凭证
       --info                只打印环境信息（同 /info）后退出，不进界面
       --dump-session        打印会话绑定诊断（网页会话 id、按 id 查标题的结果、
-                            列表接口的原始返回）后退出；排查会话名取不回来时用它
+                            列表接口的原始返回、接口探针）后退出
+      --dump-turn           发一轮（关深度思考、开联网搜索、新开会话）并打印原始 SSE，
+                            用来确认响应里到底有什么（比如搜索结果块）
       --grab                只扫描浏览器存储并报告诊断；找到凭证就顺手保存
   -h, --help                显示本帮助
 
@@ -118,6 +120,8 @@ struct Args {
     grab: bool,
     /// --dump-session：打印会话绑定诊断后退出（不进界面，方便复制）
     dump_session: bool,
+    /// --dump-turn：发一轮（关思考、开联网搜索）并打印原始 SSE 后退出
+    dump_turn: bool,
     help: bool,
 }
 
@@ -130,6 +134,7 @@ fn parse_args(argv: &[String]) -> Args {
             "--selftest" => args.selftest = true,
             "--info" => args.info = true,
             "--dump-session" => args.dump_session = true,
+            "--dump-turn" => args.dump_turn = true,
             "--grab" => args.grab = true,
             "--resume" => args.resume = true,
             "--config-dir" | "-c" => {
@@ -175,6 +180,10 @@ fn main() {
     }
     if args.dump_session {
         dump_session(&paths);
+        return;
+    }
+    if args.dump_turn {
+        dump_turn(&paths);
         return;
     }
     if args.selftest {
@@ -383,6 +392,41 @@ impl Core {
     }
 }
 
+/// `--dump-turn`：发一轮对话，把原始 SSE 原样打出来。
+///
+/// 关掉深度思考（输出短）、打开联网搜索（正是不确定形状的那部分），
+/// 并且开一个**全新的网页会话**，不碰你正在用的那个。
+fn dump_turn(paths: &ConfigPaths) {
+    let Some(auth) = auth::load_auth(paths) else {
+        println!("未登录，先跑 dsp 并执行 /login。");
+        return;
+    };
+    let config = config::load_config(paths);
+    let client = match DeepSeekClient::new(&config) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("客户端初始化失败：{e}");
+            return;
+        }
+    };
+    let prompt = "用一句话回答：今天是几号？请联网确认后再回答。";
+    println!("提示词：{prompt}");
+    println!("（新会话 · 深度思考 关 · 联网搜索 开）");
+    println!("--- 原始 SSE 开始 ---");
+    let mut solver =
+        match deepseek::load_pow_solver(&config.wasm_url, &config.user_agent, &config.proxy) {
+            Ok(s) => s,
+            Err(e) => {
+                println!("PoW 初始化失败：{e}");
+                return;
+            }
+        };
+    match deepseek::dump_turn(&client, &mut solver, &auth.token, prompt) {
+        Ok(()) => println!("\n--- 原始 SSE 结束 ---"),
+        Err(e) => println!("\n--- 出错：{e} ---"),
+    }
+}
+
 /// `--dump-session`：把「本地会话 ↔ 网页会话」的绑定情况打到 stdout。
 ///
 /// 专为排查「会话名取不回来」而设，它把三件事分开说清楚：
@@ -437,17 +481,10 @@ fn dump_session(paths: &ConfigPaths) {
         }
     }
 
-    println!("\n/chat_session/fetch_page 原始返回：");
-    match client.session_list_raw(&auth.token, 20000) {
-        Some(raw) => println!("{raw}"),
-        None => println!("（请求失败或解包失败：见下面的探针）"),
-    }
-
-    // 上面那步失败时，这里能看出服务端到底回了什么（状态码 + 原始体）
     println!("\n接口根地址    {}", config.api_base);
-    let (url, detail) = client.session_page_probe(&auth.token);
-    println!("探针 POST {url}");
-    println!("{detail}");
+    println!("POST {}/chat_session/fetch_page", config.api_base);
+    println!("原始返回（含状态码）：");
+    println!("{}", client.session_list_raw(&auth.token, 20000));
 }
 
 fn run(paths: ConfigPaths, resume: bool) -> anyhow::Result<()> {
@@ -964,17 +1001,13 @@ fn command(
                     None => app.line_styled("  未登录，无法查询。", ui::warn()),
                     Some(token) => match core.client() {
                         Err(e) => app.line_styled(format!("  {e}"), ui::err()),
-                        Ok(client) => match client.session_list_raw(&token, 1500) {
-                            Some(raw) => {
-                                app.line_styled(
-                                    "  /chat_session/fetch_page 原始返回（截断）：",
-                                    ui::dim(),
-                                );
-                                app.line(format!("  {raw}"));
-                            }
-                            None => app
-                                .line_styled("  接口请求失败，看 /status 有没有报错。", ui::warn()),
-                        },
+                        Ok(client) => {
+                            app.line_styled(
+                                "  /chat_session/fetch_page 原始返回（截断）：",
+                                ui::dim(),
+                            );
+                            app.line(format!("  {}", client.session_list_raw(&token, 1500)));
+                        }
                     },
                 }
             } else {
