@@ -282,6 +282,10 @@ pub fn build_tool_doc(lang: Lang) -> String {
 - 改已有文件优先 edit：不要为了改一行把整个文件 write 一遍。\n\
 - 联网查资料用内置的联网搜索（不用调工具，正常提问即可）；\n\
   search 只搜本地文件内容，别拿它当搜索引擎。\n\
+- 联网能力由界面开关控制（状态栏「Ctrl+S 智能搜索」）。开着时服务端会替你联网查，\n\
+  你**不要说「我不能访问外网」「我只能查本地文件」**这种话 —— 那是不对的。\n\
+- 需要联网却没拿到任何来源时，提醒用户确认 Ctrl+S 的智能搜索是否打开，\n\
+  而不是直接说做不到。\n\
 {parallel}"
         ),
         Lang::En => format!(
@@ -310,6 +314,11 @@ Rules:\n\
 - Prefer edit over write for changing an existing file; never rewrite a whole file just to change a line.\n\
 - For online lookups use the built-in web search (just ask; no tool call needed).\n\
   search only covers local file contents — it is not a web search engine.\n\
+- Web access is controlled by an on-screen toggle (status bar Ctrl+S). While it is on,\n\
+  the server searches for you: never say you cannot access the internet or that you can\n\
+  only look at local files.\n\
+- If a question needs the web and you got no sources back, remind the user to check the\n\
+  Ctrl+S web-search toggle instead of refusing outright.\n\
 {parallel}"
         ),
     }
