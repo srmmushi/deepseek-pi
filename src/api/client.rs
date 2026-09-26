@@ -534,6 +534,43 @@ impl DeepSeekClient {
         format!("{}{}", self.config.api_base, path)
     }
 
+    /// 原始 POST：**不解包**，直接把 (状态码, 响应体) 拿出来。
+    ///
+    /// 接口形状不明时用它 —— 能看到服务端到底回了什么，
+    /// 而不是只得到一个「失败」。
+    fn raw_post(&self, path: &str, token: &str, body: &Value) -> Result<(u16, String), DsError> {
+        self.throttle();
+        let res = self
+            .http
+            .post(self.url(path))
+            .headers(self.build_headers(Some(token), None, true))
+            .body(body.to_string())
+            .send()
+            .map_err(|e| DsError::Other(format!("请求没发出去：{e}")))?;
+        let status = res.status().as_u16();
+        let text = res.text().unwrap_or_default();
+        Ok((status, text))
+    }
+
+    /// 会话列表接口探针：返回 (完整 URL, 状态码与响应体)。
+    ///
+    /// 会话名取不回来时靠它定位：是路径不对（404）、还是要求别的鉴权（403）、
+    /// 还是形状变了（200 但字段名不同）—— 一眼能分开。
+    pub fn session_page_probe(&self, token: &str) -> (String, String) {
+        let url = self.url(EP_SESSION_PAGE);
+        match self.raw_post(EP_SESSION_PAGE, token, &json!({ "count": 50 })) {
+            Ok((status, body)) => {
+                let total = body.chars().count();
+                let mut text: String = body.chars().take(4000).collect();
+                if total > 4000 {
+                    text.push_str(&format!(" …（共 {total} 字符，已截断）"));
+                }
+                (url, format!("HTTP {status}\n{text}"))
+            }
+            Err(e) => (url, format!("请求没发出去：{e}")),
+        }
+    }
+
     /// POST JSON 并解开信封，返回 biz_data
     fn post_json(&self, path: &str, token: &str, body: &Value) -> Result<Value, DsError> {
         self.throttle();

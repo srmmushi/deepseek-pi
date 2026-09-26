@@ -440,8 +440,14 @@ fn dump_session(paths: &ConfigPaths) {
     println!("\n/chat_session/fetch_page 原始返回：");
     match client.session_list_raw(&auth.token, 20000) {
         Some(raw) => println!("{raw}"),
-        None => println!("（请求失败：网络或凭证问题，可先跑 --selftest 看看）"),
+        None => println!("（请求失败或解包失败：见下面的探针）"),
     }
+
+    // 上面那步失败时，这里能看出服务端到底回了什么（状态码 + 原始体）
+    println!("\n接口根地址    {}", config.api_base);
+    let (url, detail) = client.session_page_probe(&auth.token);
+    println!("探针 POST {url}");
+    println!("{detail}");
 }
 
 fn run(paths: ConfigPaths, resume: bool) -> anyhow::Result<()> {
