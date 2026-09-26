@@ -846,7 +846,12 @@ impl DeepSeekClient {
 
 /// 会话列表可能藏在几个不同的键下面，也可能再包一层 data —— 逐个试
 fn session_list(data: &Value) -> Option<&Vec<Value>> {
-    for key in ["chat_sessions", "sessions", "chat_session"] {
+    for key in [
+        "chat_sessions",
+        "sessions",
+        "chat_session",
+        "conversations",
+    ] {
         if let Some(arr) = data.get(key).and_then(|v| v.as_array()) {
             return Some(arr);
         }
@@ -861,11 +866,15 @@ fn session_list(data: &Value) -> Option<&Vec<Value>> {
     None
 }
 
-/// 在列表里按 id 找标题；id 的键名同样试两种
+/// 在列表里按 id 找标题。
+///
+/// 键名多试几个：网页端的会话 id 是 UUID（形如
+/// `4ae00872-12d9-4427-8c1c-8600827d06cd`，就是 `/a/chat/s/<id>` 里那一段），
+/// 而它在不同接口里可能叫 id / session_id / conversation_id / chat_session_id。
 fn pick_title(list: &[Value], session_id: &str) -> Option<String> {
     list.iter()
         .find(|s| {
-            ["id", "chat_session_id"]
+            ["id", "session_id", "conversation_id", "chat_session_id"]
                 .iter()
                 .any(|k| s.get(*k).and_then(|v| v.as_str()) == Some(session_id))
         })

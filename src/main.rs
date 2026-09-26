@@ -877,6 +877,13 @@ fn command(
                         .map(|v| v.to_string())
                         .unwrap_or_else(|| "（空）".to_string())
                 ));
+                app.line(format!(
+                    "  会话链接      {}",
+                    match &s.handle.session_id {
+                        Some(id) => format!("https://chat.deepseek.com/a/chat/s/{id}"),
+                        None => "（还没绑上网页会话）".to_string(),
+                    }
+                ));
                 match core.token.clone() {
                     None => app.line_styled("  未登录，无法查询。", ui::warn()),
                     Some(token) => match core.client() {
