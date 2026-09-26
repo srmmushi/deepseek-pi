@@ -932,7 +932,8 @@ pub fn stream_chat(
     thinking_enabled: bool,
     search_enabled: bool,
     handle: Option<&mut WebSessionHandle>,
-    /// 原始字节的旁路（`--dump-turn` 用它打印 SSE 原文）；正常路径传空闭包
+    // 原始字节的旁路（`--dump-turn` 用它打印 SSE 原文）；正常路径传空闭包。
+    // 参数上不能写 `///`（那是给项的），这里是普通注释。
     tee: &mut dyn FnMut(&str),
     on_event: &mut dyn FnMut(StreamEvent) -> bool,
 ) -> Result<(), DsError> {
