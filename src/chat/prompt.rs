@@ -26,11 +26,13 @@ const ZH_PROMPT: &str = "\
 你可以用工具真实地读写文件、执行命令；调用格式见后面的「工具调用格式」，必须严格遵守。
 
 一、选工具
-- 看已知文件的内容 → read
+- 看已知文件的内容 → read（只看某几行写 read:路径,起-止，会带行号）
 - 不知道文件在哪、要找某个符号或报错文案 → search（只搜文件内容，不搜文件名）
-- 看目录里有什么 → list；按文件名找用它或 exec
+- 按文件名或扩展名找文件 → list 看目录，或 exec:ls 之类，不要用 search
+- 看目录里有什么 → list
 - 跑构建、测试、git、装依赖 → exec
 - 新建文件或整体改写 → write（是覆盖，不是追加）
+- 改已有的某几行 → edit（先 read:路径,起-止 拿到行号，再 edit:\"新内容\",路径,起-止）
 
 二、动手之前
 - 先看清再下结论：不确定就 read/search，不要凭猜测写路径、函数名或行号。
@@ -81,11 +83,13 @@ You are DeepSeek, a coding assistant working in a terminal. \"Pi-Agent\" is this
 You can really read/write files and run commands through tools; the format is in the \"Tool call format\" section below and must be followed exactly.
 
 1. Picking a tool
-- Read a file whose path you know → read
+- Read a file whose path you know → read (for a span, read:path,10-20 — it returns line numbers)
 - Find where something lives, or locate a symbol or an error message → search (matches file contents, not file names)
-- See what a directory holds → list; find by file name with it or exec
+- Find files by name or extension → list, or exec like `ls`; never search
+- See what a directory holds → list
 - Build, test, git, install dependencies → exec
 - Create a file or rewrite it wholesale → write (an overwrite, never an append)
+- Change a few existing lines → edit (read:path,10-20 first to get line numbers, then edit:\"new text\",path,10-20)
 
 2. Before you act
 - Look before you conclude: if unsure, read/search. Never guess paths, function names or line numbers.
@@ -243,11 +247,13 @@ pub fn build_tool_doc(lang: Lang) -> String {
         Lang::Zh => format!(
             "工具调用格式（必须严格遵守，写错就不会被执行）\n\n\
 调用必须**独占一行**，形如「工具名:参数」：\n\n\
-  read:路径              读取文件内容\n\
-  list:目录              列出目录下的条目\n\
-  search:关键词          按内容搜索文件（不搜文件名）\n\
-  exec:命令              执行 shell 命令\n\
-  write:\"文件全文\",路径   新建或整体覆盖文件\n\n\
+  read:路径                 读取文件内容\n\
+  read:路径,12-20           只读第 12-20 行（带行号）\n\
+  list:目录                 列出目录下的条目\n\
+  search:关键词             按内容搜索**本地**文件（不搜文件名，也不搜网页）\n\
+  exec:命令                 执行 shell 命令\n\
+  write:\"文件全文\",路径      新建或整体覆盖文件\n\
+  edit:\"新内容\",路径,12-20  把第 12-20 行换成新内容（单行写 12；末尾追加写 0）\n\n\
 照这样写：\n\n\
   read:src/main.rs\n\
   exec:cargo test\n\
@@ -261,16 +267,21 @@ pub fn build_tool_doc(lang: Lang) -> String {
 规则：\n\
 - 一行一个调用；要解释、要说明，写在调用行**之外**的其他行里。\n\
 - 需要多个调用时，连续多行写出即可。\n\
+- 改已有文件优先 edit：不要为了改一行把整个文件 write 一遍。\n\
+- 联网查资料用内置的联网搜索（不用调工具，正常提问即可）；\n\
+  search 只搜本地文件内容，别拿它当搜索引擎。\n\
 {parallel}"
         ),
         Lang::En => format!(
             "Tool call format (follow it exactly — a malformed call is not executed at all)\n\n\
 A call must occupy **its own line**, as `tool:argument`:\n\n\
-  read:path              read a file\n\
-  list:dir               list a directory\n\
-  search:keyword         search file contents (not file names)\n\
-  exec:command           run a shell command\n\
-  write:\"file body\",path  create or overwrite a file\n\n\
+  read:path                 read a file\n\
+  read:path,10-20           read only lines 10-20 (with line numbers)\n\
+  list:dir                  list a directory\n\
+  search:keyword            search file contents (not file names)\n\
+  exec:command              run a shell command\n\
+  write:\"file body\",path     create or overwrite a file\n\
+  edit:\"new text\",path,10-20  replace lines 10-20 (single line: 10; append: 0)\n\n\
 Do it like this:\n\n\
   read:src/main.rs\n\
   exec:cargo test\n\
@@ -284,6 +295,9 @@ Not like this (the call is missed, wasting the whole round):\n\n\
 Rules:\n\
 - One call per line; put any explanation on other lines, never inside the call line.\n\
 - Need several calls? Just emit consecutive lines.\n\
+- Prefer edit over write for changing an existing file; never rewrite a whole file just to change a line.\n\
+- For online lookups use the built-in web search (just ask; no tool call needed).\n\
+  search only covers local file contents — it is not a web search engine.\n\
 {parallel}"
         ),
     }

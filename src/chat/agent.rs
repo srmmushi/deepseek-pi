@@ -441,6 +441,11 @@ pub fn run_turn(
                         acc.emitted_len += lines.len();
                         drop(acc);
                         for line in lines {
+                            // 工具调用行不当正文显示：随后会以「▌ 工具名 参数」
+                            // 单独列出来，正文里再打一遍就是重复
+                            if crate::tools::is_tool_call_line(&line) {
+                                continue;
+                            }
                             let _ = tx_cb.send(UiEvent::Line(line));
                         }
                     }
@@ -463,7 +468,7 @@ pub fn run_turn(
                             ))
                         };
                         drop(acc);
-                        if !pending.is_empty() {
+                        if !pending.is_empty() && !crate::tools::is_tool_call_line(&pending) {
                             let _ = tx_cb.send(UiEvent::Line(pending));
                         }
                         if let Some((text, ms)) = closing {

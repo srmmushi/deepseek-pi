@@ -22,7 +22,7 @@ const EXEC_TIMEOUT_SECS: u64 = 120;
 /// 输出上限（字符）
 const MAX_OUTPUT_CHARS: usize = 40_000;
 
-/// 支持的五个核心工具
+/// 支持的工具
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolName {
     Write,
@@ -30,6 +30,8 @@ pub enum ToolName {
     List,
     Exec,
     Search,
+    /// 按行改文件（改单行或多行）
+    Edit,
 }
 
 impl ToolName {
@@ -40,6 +42,7 @@ impl ToolName {
             ToolName::List => "list",
             ToolName::Exec => "exec",
             ToolName::Search => "search",
+            ToolName::Edit => "edit",
         }
     }
 
@@ -50,6 +53,7 @@ impl ToolName {
             "list" => Some(ToolName::List),
             "exec" => Some(ToolName::Exec),
             "search" => Some(ToolName::Search),
+            "edit" => Some(ToolName::Edit),
             _ => None,
         }
     }
@@ -59,10 +63,22 @@ impl ToolName {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolCall {
     Write { content: String, path: String },
-    Read { path: String },
+    /// 读文件；`range` 给了就只读这几行（闭区间，从 1 起）
+    Read {
+        path: String,
+        range: Option<(usize, usize)>,
+    },
     List { path: String },
     Exec { command: String },
     Search { query: String },
+    /// 按行改文件：把 `path` 的第 from–to 行（闭区间）换成 `content`。
+    /// `from == 0` 表示在文件末尾追加。
+    Edit {
+        content: String,
+        path: String,
+        from: usize,
+        to: usize,
+    },
 }
 
 impl ToolCall {
@@ -73,6 +89,7 @@ impl ToolCall {
             ToolCall::List { .. } => ToolName::List,
             ToolCall::Exec { .. } => ToolName::Exec,
             ToolCall::Search { .. } => ToolName::Search,
+            ToolCall::Edit { .. } => ToolName::Edit,
         }
     }
 }
@@ -125,46 +142,82 @@ fn unquote(input: &str) -> String {
     s.to_string()
 }
 
+/// 拆出开头的引号内容，返回 `(内容, 结束引号之后的剩余部分)`。
+fn split_quoted(rest: &str) -> Result<(String, String), String> {
+    let chars: Vec<char> = rest.chars().collect();
+    if chars.is_empty() || (chars[0] != '"' && chars[0] != '\'') {
+        return Err("内容需要用引号包起来，形如 \"内容\",路径".to_string());
+    }
+    let quote = chars[0];
+    let mut i = 1;
+    let mut content = String::new();
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch == '\\' && i + 1 < chars.len() {
+            let next = chars[i + 1];
+            content.push(match next {
+                'n' => '\n',
+                't' => '\t',
+                'r' => '\r',
+                other => other,
+            });
+            i += 2;
+            continue;
+        }
+        if ch == quote && looks_like_terminator(&chars[i + 1..], quote) {
+            let tail: String = chars[i + 1..].iter().collect();
+            return Ok((content, tail));
+        }
+        content.push(ch);
+        i += 1;
+    }
+    Err("内容缺少结束引号（结尾应为 \",路径）".to_string())
+}
+
+/// 结束引号后面那段是不是「,路径」该有的样子。
+///
+/// 这个判断是必须的：写 HTML/JS 时内容里几乎一定有没转义的引号，
+/// 只要见到引号就收尾，整段内容会被从中间截断（而且不会有任何报错）。
+fn looks_like_terminator(after: &[char], quote: char) -> bool {
+    let rest: String = after.iter().collect();
+    let rest = rest.trim_start().trim_start_matches(',').trim();
+    if rest.is_empty() {
+        return false;
+    }
+    // 路径就剩最后一段，不该再出现换行或引号
+    !rest.contains('\n') && !rest.contains(quote) && !rest.contains('"') && !rest.contains('\'')
+}
+
+/// 解析 `12` / `12-20` / `0`（0 表示文件末尾）
+fn parse_range(s: &str) -> Option<(usize, usize)> {
+    let s = s.trim();
+    if let Some((a, b)) = s.split_once('-') {
+        return match (a.trim().parse::<usize>(), b.trim().parse::<usize>()) {
+            (Ok(a), Ok(b)) => Some((a, b)),
+            _ => None,
+        };
+    }
+    s.parse::<usize>().ok().map(|n| (n, n))
+}
+
+/// 从参数尾部拆出 `,12-20` 这样的行范围。
+/// 只有确实长得像范围才拆 —— 免得把文件名里的逗号当成分隔符。
+fn split_line_range(s: &str) -> (String, Option<(usize, usize)>) {
+    let Some((head, tail)) = s.rsplit_once(',') else {
+        return (s.to_string(), None);
+    };
+    match parse_range(tail) {
+        Some(r) => (head.to_string(), Some(r)),
+        None => (s.to_string(), None),
+    }
+}
+
 /// 解析 write 的参数：`"内容",路径`（兼容不带引号的写法）
 fn parse_write_args(rest: &str) -> Result<(String, String), String> {
-    let chars: Vec<char> = rest.chars().collect();
-    if chars.is_empty() {
-        return Err("write 缺少参数".to_string());
-    }
-    if chars[0] == '"' || chars[0] == '\'' {
-        let quote = chars[0];
-        let mut i = 1;
-        let mut content = String::new();
-        let mut closed = false;
-        while i < chars.len() {
-            let ch = chars[i];
-            if ch == '\\' && i + 1 < chars.len() {
-                let next = chars[i + 1];
-                content.push(match next {
-                    'n' => '\n',
-                    't' => '\t',
-                    'r' => '\r',
-                    other => other,
-                });
-                i += 2;
-                continue;
-            }
-            if ch == quote {
-                closed = true;
-                i += 1;
-                break;
-            }
-            content.push(ch);
-            i += 1;
-        }
-        if !closed {
-            return Err("write 内容缺少结束引号".to_string());
-        }
-        while i < chars.len() && (chars[i] == ',' || chars[i].is_whitespace()) {
-            i += 1;
-        }
-        let path: String = chars[i..].iter().collect();
-        let path = unquote(&path);
+    let trimmed = rest.trim_start();
+    if trimmed.starts_with('"') || trimmed.starts_with('\'') {
+        let (content, tail) = split_quoted(trimmed)?;
+        let path = unquote(tail.trim_start_matches(',').trim());
         if path.is_empty() {
             return Err("write 缺少文件路径".to_string());
         }
@@ -192,11 +245,42 @@ fn build_call(name: &str, rest: &str) -> Result<ToolCall, String> {
             Ok(ToolCall::Write { content, path })
         }
         ToolName::Read => {
-            let path = unquote(rest);
+            // `read:路径` 读全文；`read:路径,12-20` 只读这段（带行号，便于随后按行改）
+            let (path_part, range) = split_line_range(rest);
+            let path = unquote(path_part.trim());
             if path.is_empty() {
                 return Err("read 缺少文件路径".to_string());
             }
-            Ok(ToolCall::Read { path })
+            Ok(ToolCall::Read { path, range })
+        }
+        ToolName::Edit => {
+            let (content, tail) = split_quoted(rest.trim_start())?;
+            let tail = tail.trim_start_matches(',').trim();
+            // 允许两种顺序：`内容,路径,12-20` 或 `内容,12-20,路径`
+            let (path_part, range) = match split_line_range(tail) {
+                (p, Some(r)) => (p, Some(r)),
+                (_, None) => {
+                    let (first, rest2) = tail.split_once(',').unwrap_or((tail, ""));
+                    match parse_range(first) {
+                        Some(r) => (rest2.trim().to_string(), Some(r)),
+                        None => (tail.to_string(), None),
+                    }
+                }
+            };
+            let path = unquote(path_part.trim());
+            if path.is_empty() {
+                return Err("edit 缺少文件路径".to_string());
+            }
+            let (from, to) = range.ok_or_else(|| {
+                "edit 缺少行范围，形如 edit:\"新内容\",路径,12-20（单行写 12，末尾追加写 0）"
+                    .to_string()
+            })?;
+            Ok(ToolCall::Edit {
+                content,
+                path,
+                from,
+                to,
+            })
         }
         ToolName::List => {
             let path = unquote(rest);
@@ -255,6 +339,14 @@ fn strip_markup(line: &str) -> &str {
     }
 }
 
+/// 这一行是不是工具调用？
+///
+/// 界面上用到：模型输出的调用行会另外以「▌ 工具名 参数」列出来，
+/// 正文里再原样打一遍就是重复。
+pub fn is_tool_call_line(line: &str) -> bool {
+    call_head(line).is_some()
+}
+
 /// 这一行是不是一个工具调用的开头？是则给出小写的工具名。
 ///
 /// 工具名上的强调符号在这里一并剥掉（`**read**:x` 也算 `read`）。
@@ -302,7 +394,8 @@ pub fn parse_tool_calls(text: &str) -> ParseResult {
         let start_line = i + 1;
 
         let mut call = build_call(&head, &body);
-        if head == "write" {
+        // write 与 edit 的内容都可能跨很多行，边拼边试
+        if head == "write" || head == "edit" {
             let mut used = 0;
             while call.is_err() && i + 1 < lines.len() && used < 2000 {
                 let next = strip_markup(lines[i + 1]);
@@ -385,7 +478,17 @@ mod tests {
 pub fn describe_call(call: &ToolCall) -> String {
     match call {
         ToolCall::Write { content, path } => format!("{path}（{} 字节）", content.len()),
-        ToolCall::Read { path } => path.clone(),
+        ToolCall::Read { path, range } => match range {
+            Some((a, b)) => format!("{path} · {a}-{b} 行"),
+            None => path.clone(),
+        },
+        ToolCall::Edit { path, from, to, .. } => {
+            if *from == 0 {
+                format!("{path} · 末尾追加")
+            } else {
+                format!("{path} · {from}-{to} 行")
+            }
+        }
         ToolCall::List { path } => path.clone(),
         ToolCall::Exec { command } => command.clone(),
         ToolCall::Search { query } => query.clone(),
@@ -470,7 +573,7 @@ fn run_write(content: &str, path: &str, cwd: &Path, lang: Lang) -> ToolResult {
     }
 }
 
-fn run_read(path: &str, cwd: &Path, lang: Lang) -> ToolResult {
+fn run_read(path: &str, range: Option<(usize, usize)>, cwd: &Path, lang: Lang) -> ToolResult {
     let abs = to_absolute(cwd, path);
     let meta = match std::fs::metadata(&abs) {
         Ok(m) => m,
@@ -507,14 +610,40 @@ fn run_read(path: &str, cwd: &Path, lang: Lang) -> ToolResult {
         };
     }
     let text = String::from_utf8_lossy(&bytes).to_string();
-    let line_count = text.lines().count().max(1);
+    let all: Vec<&str> = text.lines().collect();
+    let line_count = all.len().max(1);
+
+    // 指定了行范围：带行号返回，模型照着行号就能用 edit 精确改
+    if let Some((from, to)) = range {
+        let from = from.max(1);
+        let to = to.min(line_count).max(from);
+        if from > line_count {
+            return ToolResult {
+                ok: false,
+                output: format!("read 失败：{path} 只有 {line_count} 行，读不到第 {from} 行"),
+                summary: path.to_string(),
+            };
+        }
+        let body = (from..=to)
+            .filter_map(|n| all.get(n - 1).map(|l| format!("{n:>5}  {l}")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return ToolResult {
+            ok: true,
+            output: format!(
+                "[read] {path} 第 {from}-{to} 行（全文 {line_count} 行，行号可直接用于 edit）\n{body}"
+            ),
+            summary: format!("{path} · {from}-{to} 行"),
+        };
+    }
+
     let (body, truncated) = if text.chars().count() > MAX_READ_CHARS {
         (text.chars().take(MAX_READ_CHARS).collect::<String>(), true)
     } else {
         (text, false)
     };
     let tail = if truncated {
-        format!("\n（输出已截断，仅显示前 {MAX_READ_CHARS} 字符）")
+        format!("\n（已截断，仅前 {MAX_READ_CHARS} 字符；可用 read:路径,起始-结束 分段读）")
     } else {
         String::new()
     };
@@ -747,14 +876,81 @@ fn run_exec(command: &str, cwd: &Path, lang: Lang) -> ToolResult {
     }
 }
 
+/// 按行改：把第 from–to 行换成 content；`from == 0` 表示在末尾追加。
+///
+/// 有了它，模型改一行不必把整个文件重写一遍 —— 省 token，也不会因为
+/// 顺带重排而改坏别的部分。
+fn run_edit(content: &str, path: &str, from: usize, to: usize, cwd: &Path) -> ToolResult {
+    let abs = to_absolute(cwd, path);
+    let text = match std::fs::read_to_string(&abs) {
+        Ok(t) => t,
+        Err(e) => {
+            return ToolResult {
+                ok: false,
+                output: format!("edit 失败：{e}"),
+                summary: path.to_string(),
+            }
+        }
+    };
+    let keep_trailing_newline = text.ends_with('\n');
+    let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    let total = lines.len();
+    let new_lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+
+    let what = if from == 0 {
+        lines.extend(new_lines.iter().cloned());
+        "末尾追加".to_string()
+    } else {
+        if from > total || to < from || to > total {
+            return ToolResult {
+                ok: false,
+                output: format!(
+                    "edit 失败：行范围 {from}-{to} 超出 1-{total}\
+                     （先用 read:{path},起始-结束 确认行号；末尾追加写 0）"
+                ),
+                summary: path.to_string(),
+            };
+        }
+        lines.splice((from - 1)..to, new_lines.iter().cloned());
+        format!("{from}-{to} 行")
+    };
+
+    let mut out = lines.join("\n");
+    if keep_trailing_newline {
+        out.push('\n');
+    }
+    if let Err(e) = std::fs::write(&abs, out) {
+        return ToolResult {
+            ok: false,
+            output: format!("edit 写入失败：{e}"),
+            summary: path.to_string(),
+        };
+    }
+    ToolResult {
+        ok: true,
+        output: format!(
+            "[edit] {path}\n已替换 {what}（写入 {} 行，现在共 {} 行）",
+            new_lines.len(),
+            lines.len()
+        ),
+        summary: format!("{path} · {what}"),
+    }
+}
+
 /// 执行一个工具调用
 pub fn execute_tool(call: &ToolCall, cwd: &Path, lang: Lang) -> ToolResult {
     match call {
         ToolCall::Write { content, path } => run_write(content, path, cwd, lang),
-        ToolCall::Read { path } => run_read(path, cwd, lang),
+        ToolCall::Read { path, range } => run_read(path, *range, cwd, lang),
         ToolCall::List { path } => run_list(path, cwd, lang),
         ToolCall::Exec { command } => run_exec(command, cwd, lang),
         ToolCall::Search { query } => run_search(query, cwd, lang),
+        ToolCall::Edit {
+            content,
+            path,
+            from,
+            to,
+        } => run_edit(content, path, *from, *to, cwd),
     }
 }
 
