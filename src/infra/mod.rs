@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod browser;
 pub mod clipboard;
+pub mod commands;
 pub mod config;
 pub mod plugins;
 pub mod undo;

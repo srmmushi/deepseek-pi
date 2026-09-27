@@ -276,6 +276,43 @@ my-plugin/
 > 解压不依赖系统里的 `unzip`，也没多拉 zip 库：`infra/zip.rs` 自己读中央目录，
 > 支持存储与 deflate 两种（deflate 借 `flate2`，它本来就在依赖树里 —— `image` 解 png 用到）。
 
+## 项目规则：`AGENTS.md` 与 `/init`
+
+项目根目录放 `AGENTS.md`（`CLAUDE.md` 也认，`AGENTS.md` 优先），内容会**自动并入系统
+提示词的末尾** —— 每个项目一份的规则，不用每次在对话里重复交代。超过 16KB 会截断并
+在提示词里写明（按字符边界切，中文不会切成乱码）；塞满上下文反而挤掉正事。
+
+`/init` 让模型先读一遍项目（结构、README、构建配置），再写出一份 `AGENTS.md`：
+
+```text
+/init      已经有 AGENTS.md 就不动，避免覆盖你手写的内容
+```
+
+生成的是**项目特有**的东西：构建/测试/运行命令、代码风格、目录职责、已知的坑、以及
+「不要做什么」。它写完的文件也走 `write` 工具，所以 `/undo` 一样能退。
+
+## 自定义命令：一个 `.md` 就是一个命令
+
+照抄 Claude Code（`.claude/commands/*.md`）和 OpenCode（`.opencode/command/*.md`）的做法：
+
+```text
+<项目>/.dsp/commands/review.md     项目级（同名时优先）
+<配置目录>/commands/review.md       用户级
+```
+
+文件名即命令名，正文就是发给模型的提示词，`$ARGUMENTS` 换成命令后面的参数
+（正文里没有 `$ARGUMENTS` 就把参数附在末尾）：
+
+```markdown
+# 审查改动
+逐个看我改过的文件，指出真正的问题（不是风格偏好）。$ARGUMENTS
+```
+
+于是 `/review src/` 就等于把这段提示词发了出去。`/commands` 列出全部可用命令。
+
+**内置命令永远优先**：查不到才轮到命令文件（判定放在命令 `match` 的最后那个分支），
+所以叫 `help.md` 的命令顶不掉 `/help`，不会把人锁在外面。
+
 ## 撤销：`/undo`
 
 借鉴 Aider 的 `/undo` —— 它的回退单位是「一次改动批次」而不是单个文件，

@@ -8,11 +8,11 @@ pub(crate) mod tui;
 
 pub(crate) use api::{client as deepseek, stream};
 pub(crate) use chat::{agent, prompt, tools};
-pub(crate) use infra::{auth, browser, clipboard, config, plugins, undo};
+pub(crate) use infra::{auth, browser, clipboard, commands, config, plugins, undo};
 pub(crate) use tui::{app as ui, i18n, sysinfo};
 
 use std::io::Stdout;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -61,7 +61,8 @@ DSP (deepseek-pi) —— 终端编程助手，仅使用 DeepSeek 网页版
 
 命令
   /help /login /logout /new /session /clear /goto /thinking /search
-  /model /lang /status /info /open /export /plugins /undo /system-prompt /quit
+  /model /lang /status /info /open /export /plugins /undo /init /commands
+  /system-prompt /quit
 
 会话
   /new               新建会话（清空上下文）
@@ -83,6 +84,15 @@ DSP (deepseek-pi) —— 终端编程助手，仅使用 DeepSeek 网页版
   包结构：plugin.json 写 name / version / description，可选 prompt.md
           prompt.md 会追加进系统提示词（下次启动或 /new 之后生效）
   包里带 `../` 之类的越界路径会整包拒绝，不会写到插件目录之外
+
+项目规则与自定义命令
+  /init              让模型读一遍这个项目，然后生成 AGENTS.md 当项目规则
+  项目根放 AGENTS.md   会自动并入系统提示词末尾（CLAUDE.md 也认，AGENTS.md 优先）
+                     超过 16KB 会截断并说明，免得规则挤掉正事
+  /commands          列出自定义命令。放一个 .md 就是一个命令：
+                     <项目>/.dsp/commands/*.md（同名时优先）或 <配置目录>/commands/*.md
+                     正文就是提示词，$ARGUMENTS 换成命令后面的参数
+                     内置命令优先 —— 自定义命令顶不掉 /help 这类
 
 环境
   /info              系统、架构、构建号（当前那次 git 提交）、主机名；WSL 才显示虚拟机
@@ -366,6 +376,11 @@ impl Core {
         }
         let prompt = prompt::load_system_prompt(&self.paths, self.lang);
         let mut text = agent::build_system_text(&prompt, &cwd, self.lang);
+        // 项目规则（AGENTS.md / CLAUDE.md）：一个项目一份，也是「所有会话共用」的信息，
+        // 所以同样放在末尾这一区 —— 前面那段前缀越稳，跨会话缓存越容易命中。
+        if let Some((name, body)) = project_rules(&cwd) {
+            text.push_str(&format!("\n\n## 项目规则（{name}）\n{body}"));
+        }
         // 插件的提示词追加在**最末尾**：它每个会话都一样，所以不会打乱前面
         // 那段所有会话共用的前缀（缓存照样命中），同时插件能扩展行为。
         for (name, body) in plugins::prompt_additions(&self.paths, &self.config) {
@@ -1011,10 +1026,58 @@ fn command(
                 }
             }
         }
+        // /init       让模型读一遍项目，然后生成 AGENTS.md（项目规则）
+        // /commands   列出自定义命令
+        "/init" => {
+            let cwd = core.session.lock().unwrap().cwd.clone();
+            let target = cwd.join("AGENTS.md");
+            if target.exists() {
+                app.line_styled(
+                    format!("已经有 {} 了。要重写就先删掉它；想改内容可以直接让我改。", target.display()),
+                    ui::warn(),
+                );
+            } else {
+                app.line_styled("正在让模型读这个项目，然后写 AGENTS.md…", ui::dim());
+                app.anchor("生成 AGENTS.md".to_string());
+                start_turn(core, app, init_prompt(lang, &cwd), rx);
+            }
+        }
+        "/commands" => {
+            let cwd = core.session.lock().unwrap().cwd.clone();
+            let items = commands::list(&core.paths, &cwd);
+            if items.is_empty() {
+                app.line_styled("还没有自定义命令。放一个 .md 进去就是一个命令：", ui::dim());
+                for d in commands::search_dirs(&core.paths, &cwd) {
+                    app.line(format!("  {}", d.display()));
+                }
+                app.line_styled(
+                    "正文就是提示词；正文里的 $ARGUMENTS 会换成命令后面的参数。".to_string(),
+                    ui::dim(),
+                );
+            } else {
+                app.line_styled(format!("自定义命令（{}）", items.len()), ui::user_style());
+                for c in &items {
+                    app.line(format!("  /{:<16} {}", c.name, c.about));
+                }
+                app.line_styled(
+                    "正文就是提示词；用 $ARGUMENTS 接收命令后面的参数。".to_string(),
+                    ui::dim(),
+                );
+            }
+        }
         "/status" => {
             app.line_styled(format!("{}:", core.t("cmd.status")), ui::user_style());
             app.line(format!("  配置目录   {}", core.paths.config_dir.display()));
             app.line(format!("  系统提示词 {}", core.paths.system_prompt_file.display()));
+            let cwd = core.session.lock().unwrap().cwd.clone();
+            app.line(format!("  工作目录   {}", cwd.display()));
+            match project_rules(&cwd) {
+                Some((n, _)) => app.line(format!("  项目规则   {n}（并入系统提示词末尾）")),
+                None => app.line_styled(
+                    "  项目规则   没有 AGENTS.md（/init 可以让模型生成一份）".to_string(),
+                    ui::dim(),
+                ),
+            }
             app.line(format!("  模型       {}", core.config.model));
             app.line(format!(
                 "  深度思考 {}   智能搜索 {}",
@@ -1300,7 +1363,31 @@ fn command(
                 ui::dim(),
             );
         }
-        other => app.line_styled(format!("未知命令 {other}（/help 查看全部）"), ui::warn()),
+        other => {
+            // 内置命令都不是，才轮到命令文件（见 infra/commands.rs）。
+            // 放在最后这个分支里，是为了让内置命令**永远**优先 ——
+            // 否则一个叫 help.md 的命令就能把 /help 顶掉，把人锁在外面。
+            let cwd = core.session.lock().unwrap().cwd.clone();
+            let name = other.trim_start_matches('/');
+            match commands::expand(&core.paths, &cwd, name, &arg) {
+                Some((text, path)) => {
+                    app.line_styled(
+                        format!(
+                            "▌ 自定义命令 {}{}",
+                            path.file_name().unwrap_or_default().to_string_lossy(),
+                            " —— 正文即提示词"
+                        ),
+                        ui::dim(),
+                    );
+                    app.anchor(format!("/{name}"));
+                    start_turn(core, app, text, rx);
+                }
+                None => app.line_styled(
+                    format!("未知命令 {other}（/help 看内置；/commands 看自定义）"),
+                    ui::warn(),
+                ),
+            }
+        }
     }
 }
 
@@ -1594,6 +1681,79 @@ fn export_markdown(session: &Session, path: &std::path::Path) -> std::io::Result
         out.push_str(&format!("## {who}\n\n{content}\n\n"));
     }
     std::fs::write(path, out)
+}
+
+/// 项目规则文件的上限。规则塞满上下文反而挤掉正事，所以超了就截断并说明。
+const RULES_LIMIT: usize = 16 * 1024;
+
+/// 读项目的规则文件：`AGENTS.md`（agents.md 那套约定，Codex/OpenCode 等都认）
+/// 优先，其次 `CLAUDE.md`。取第一个存在的，返回 `(文件名, 正文)`。
+fn project_rules(cwd: &Path) -> Option<(String, String)> {
+    for name in ["AGENTS.md", "CLAUDE.md"] {
+        let Ok(text) = std::fs::read_to_string(cwd.join(name)) else {
+            continue;
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let body = if text.len() > RULES_LIMIT {
+            // 按字节切会把 UTF-8 切坏（中文规则一截就乱码），所以先退到字符边界
+            let end = floor_char_boundary(text, RULES_LIMIT);
+            format!(
+                "{}\n\n（以上被截断：原文 {} 字节，只取前 {RULES_LIMIT} 字节）",
+                &text[..end],
+                text.len()
+            )
+        } else {
+            text.to_string()
+        };
+        return Some((name.to_string(), body));
+    }
+    None
+}
+
+/// 不超过 `i` 的最大字符边界（UTF-8 切片必须落在边界上）
+fn floor_char_boundary(s: &str, mut i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// `/init` 让模型干的事：先看项目，再写 AGENTS.md
+fn init_prompt(lang: Lang, cwd: &Path) -> String {
+    match lang {
+        Lang::Zh => format!(
+            "先了解这个项目，然后在项目根目录（{}）写下 AGENTS.md，给后续的 AI 助手当规则用。\n\n\
+             要求：\n\
+             1. 先动手看：用 list:. 看结构，读 README、构建配置（Cargo.toml / package.json / \
+             pyproject.toml 等）和能反映约定的入口文件；不要凭目录名猜。\n\
+             2. 只写**这个项目特有**的内容：构建/测试/运行命令（原样可用）、代码风格与约定、\
+             目录职责、容易踩的坑、以及明确规定「不要做什么」。\n\
+             3. 简明，控制在 60 行内，用 markdown 小标题分节。\n\
+             4. 不确定的地方宁可写「（待确认）」，不要编。\n\
+             5. 用一次 write:\"完整内容\",AGENTS.md 写完（是完整文件，不是片段）。\n\
+             6. 写完用一句话告诉我你写了什么。",
+            cwd.display()
+        ),
+        Lang::En => format!(
+            "Learn this project, then write AGENTS.md at its root ({}) as rules for future AI assistants.\n\n\
+             Requirements:\n\
+             1. Look first: `list:.`, read the README, the build config (Cargo.toml / package.json / \
+             pyproject.toml), and entry files that reveal conventions. Do not guess from folder names.\n\
+             2. Cover only what is **specific to this project**: build/test/run commands (copy-pasteable), \
+             style and conventions, what each directory is for, known pitfalls, and explicit \"do not\" rules.\n\
+             3. Keep it under 60 lines, with markdown headings.\n\
+             4. Write \"(unconfirmed)\" instead of inventing facts.\n\
+             5. Write it in one call: write:\"full content\",AGENTS.md.\n\
+             6. Then summarise in one sentence what you wrote.",
+            cwd.display()
+        ),
+    }
 }
 
 /// 进入一个会话：换会话、清屏、完整回放（含可展开的思考）。

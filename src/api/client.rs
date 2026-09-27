@@ -143,7 +143,7 @@ pub fn encode_pow_header(challenge: &Challenge, answer: i64) -> String {
     B64.encode(payload.to_string())
 }
 
-/// ── PoW 求解器（wasmi 执行官方 sha3 WASM）────────────────────
+// ── PoW 求解器（wasmi 执行官方 sha3 WASM）────────────────────
 
 /// PoW 求解器：持有已实例化的 WASM 运行时
 pub struct PowSolver {
@@ -547,20 +547,6 @@ impl DeepSeekClient {
             req = req.query(query);
         }
         let res = req
-            .send()
-            .map_err(|e| DsError::Other(format!("请求没发出去：{e}")))?;
-        let status = res.status().as_u16();
-        let text = res.text().unwrap_or_default();
-        Ok((status, text))
-    }
-
-    fn raw_post(&self, path: &str, token: &str, body: &Value) -> Result<(u16, String), DsError> {
-        self.throttle();
-        let res = self
-            .http
-            .post(self.url(path))
-            .headers(self.build_headers(Some(token), None, true))
-            .body(body.to_string())
             .send()
             .map_err(|e| DsError::Other(format!("请求没发出去：{e}")))?;
         let status = res.status().as_u16();
