@@ -350,6 +350,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "crossterm",
+ "flate2",
  "hostname",
  "image",
  "qrcode",

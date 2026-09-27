@@ -8,7 +8,7 @@ pub(crate) mod tui;
 
 pub(crate) use api::{client as deepseek, stream};
 pub(crate) use chat::{agent, prompt, tools};
-pub(crate) use infra::{auth, browser, clipboard, config};
+pub(crate) use infra::{auth, browser, clipboard, config, plugins};
 pub(crate) use tui::{app as ui, i18n, sysinfo};
 
 use std::io::Stdout;
@@ -36,6 +36,7 @@ DSP (deepseek-pi) —— 终端编程助手，仅使用 DeepSeek 网页版
 
 用法
   dsp [--config-dir <path>] [--resume] [--selftest] [--info]
+  dsp install <插件包.zip> | uninstall <名字> | plugins
 
 选项
   -c, --config-dir <path>   配置目录（默认 ~/.pi/agent，也可用 PI_CONFIG_DIR）
@@ -60,7 +61,7 @@ DSP (deepseek-pi) —— 终端编程助手，仅使用 DeepSeek 网页版
 
 命令
   /help /login /logout /new /session /clear /goto /thinking /search
-  /model /lang /status /info /open /export /system-prompt /quit
+  /model /lang /status /info /open /export /plugins /system-prompt /quit
 
 会话
   /new               新建会话（清空上下文）
@@ -71,6 +72,14 @@ DSP (deepseek-pi) —— 终端编程助手，仅使用 DeepSeek 网页版
   /session web <序号> 进入该会话并把工作目录切过去
   /session debug     诊断网页会话绑定（会话名取不回来时用它）
   /export            把本次会话导出成 Markdown（写在当前目录）
+
+插件
+  dsp install <包.zip>     装到 <配置目录>/plugins/<名字>/（同名覆盖 = 升级）
+  dsp uninstall <名字>      卸载
+  dsp plugins              列出已装插件（界面里是 /plugins）
+  包结构：plugin.json 写 name / version / description，可选 prompt.md
+          prompt.md 会追加进系统提示词（下次启动或 /new 之后生效）
+  包里带 `../` 之类的越界路径会整包拒绝，不会写到插件目录之外
 
 环境
   /info              系统、架构、构建号（当前那次 git 提交）、主机名；WSL 才显示虚拟机
@@ -124,6 +133,8 @@ struct Args {
     dump_session: bool,
     /// --dump-turn：发一轮（关思考、开联网搜索）并打印原始 SSE 后退出
     dump_turn: bool,
+    /// `dsp install <包.zip>` / `dsp uninstall <名字>` / `dsp plugins`
+    plugin_cmd: Option<String>,
     help: bool,
 }
 
@@ -152,6 +163,11 @@ fn parse_args(argv: &[String]) -> Args {
                 args.command = Some(argv[i..].join(" "));
                 break;
             }
+            // 插件子命令：后面的参数整串交给它（路径可能带空格）
+            "install" | "uninstall" | "remove" | "plugins" => {
+                args.plugin_cmd = Some(argv[i..].join(" "));
+                break;
+            }
             _ => {}
         }
         i += 1;
@@ -167,6 +183,10 @@ fn main() {
     }
 
     let paths = config::resolve_paths(args.config_dir.as_deref());
+    // 插件子命令先处理：不进界面，结果直接打印，方便复制
+    if let Some(cmd) = args.plugin_cmd.clone() {
+        std::process::exit(plugin_cli(&paths, &cmd));
+    }
     if args.grab {
         std::process::exit(grab(&paths));
     }
@@ -342,7 +362,12 @@ impl Core {
             }
         }
         let prompt = prompt::load_system_prompt(&self.paths, self.lang);
-        let text = agent::build_system_text(&prompt, &cwd, self.lang);
+        let mut text = agent::build_system_text(&prompt, &cwd, self.lang);
+        // 插件的提示词追加在**最末尾**：它每个会话都一样，所以不会打乱前面
+        // 那段所有会话共用的前缀（缓存照样命中），同时插件能扩展行为。
+        for (name, body) in plugins::prompt_additions(&self.paths) {
+            text.push_str(&format!("\n\n## 插件：{name}\n{body}"));
+        }
         self.system_text_cache = Some((session_id, text.clone()));
         text
     }
@@ -429,6 +454,79 @@ fn dump_turn(paths: &ConfigPaths) {
     match deepseek::dump_turn(&client, &mut solver, &auth.token, prompt) {
         Ok(()) => println!("\n--- 原始 SSE 结束 ---"),
         Err(e) => println!("\n--- 出错：{e} ---"),
+    }
+}
+
+/// `dsp install <包.zip>` / `dsp uninstall <名字>` / `dsp plugins`。
+///
+/// 装在 `<配置目录>/plugins/<名字>/`。不进界面、直接打印结果 ——
+/// 与那几个 `--dump-*` 诊断开关同一个路子：好复制，出错也好贴出来。
+fn plugin_cli(paths: &ConfigPaths, line: &str) -> i32 {
+    let mut it = line.split_whitespace();
+    let cmd = it.next().unwrap_or("plugins");
+    let rest: Vec<&str> = it.collect();
+    let arg = rest.join(" ");
+    let arg = arg.trim();
+
+    match cmd {
+        "install" => {
+            if arg.is_empty() {
+                println!("用法：dsp install <插件包.zip>");
+                return 2;
+            }
+            match plugins::install(paths, std::path::Path::new(arg)) {
+                Err(e) => {
+                    println!("安装失败：{e}");
+                    1
+                }
+                Ok(p) => {
+                    let ver = if p.version.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" v{}", p.version)
+                    };
+                    println!("已安装插件 {}{ver}", p.name);
+                    if !p.description.is_empty() {
+                        println!("  {}", p.description);
+                    }
+                    println!("  装在 {}", p.dir.display());
+                    match &p.prompt {
+                        Some(f) => println!(
+                            "  提示词 {} —— 下次启动（或 /new 之后）追加进系统提示词",
+                            f.file_name().unwrap_or_default().to_string_lossy()
+                        ),
+                        None => println!("  包里没有 prompt.md，装上但不会改变行为"),
+                    }
+                    0
+                }
+            }
+        }
+        "uninstall" | "remove" => {
+            if arg.is_empty() {
+                println!("用法：dsp uninstall <插件名>");
+                return 2;
+            }
+            match plugins::uninstall(paths, arg) {
+                Ok(n) => {
+                    println!("已卸载插件 {n}");
+                    0
+                }
+                Err(e) => {
+                    println!("卸载失败：{e}");
+                    1
+                }
+            }
+        }
+        "plugins" | "list" => {
+            for l in plugins::report(paths) {
+                println!("{l}");
+            }
+            0
+        }
+        other => {
+            println!("未知子命令「{other}」。可用：install / uninstall / plugins");
+            2
+        }
     }
 }
 
@@ -896,6 +994,44 @@ fn command(
             app.set_hint(tr(next, "ui.hint").to_string());
             app.set_status(core.status_text());
             app.line_styled(tr(next, "cmd.langSet"), ui::dim());
+        }
+        // /plugins           列出装好的插件（安装/卸载在终端里用 dsp install）
+        // /plugins install <包.zip>  装一个（等价于 dsp install）
+        // /plugins uninstall <名字>  卸载
+        "/plugins" => {
+            let mut it = arg.split_whitespace();
+            let sub = it.next().unwrap_or("");
+            let rest: Vec<&str> = it.collect();
+            let rest = rest.join(" ");
+            match sub {
+                "" => {
+                    for line in plugins::report(&core.paths) {
+                        app.line(line);
+                    }
+                }
+                "install" if !rest.trim().is_empty() => {
+                    match plugins::install(&core.paths, std::path::Path::new(rest.trim())) {
+                        Ok(p) => app.line_styled(
+                            format!(
+                                "已安装插件 {} —— /new 之后它的提示词会追加进系统提示词",
+                                p.name
+                            ),
+                            ui::ok(),
+                        ),
+                        Err(e) => app.line_styled(format!("安装失败：{e}"), ui::err()),
+                    }
+                }
+                "uninstall" | "remove" if !rest.trim().is_empty() => {
+                    match plugins::uninstall(&core.paths, rest.trim()) {
+                        Ok(n) => app.line_styled(format!("已卸载插件 {n}"), ui::ok()),
+                        Err(e) => app.line_styled(format!("卸载失败：{e}"), ui::err()),
+                    }
+                }
+                _ => app.line_styled(
+                    "用法：/plugins 列出 · /plugins install <包.zip> · /plugins uninstall <名字>",
+                    ui::dim(),
+                ),
+            }
         }
         "/status" => {
             app.line_styled(format!("{}:", core.t("cmd.status")), ui::user_style());

@@ -36,6 +36,9 @@ qrcode = { version = "0.14", default-features = false }
 # 微信那边给的是图片，得先解码；解出内容再用 qrcode 重画，比缩放像素稳
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 rqrr = "0.9"
+# 插件包解压：只解 deflate。flate2 本来就在依赖树里（image 解 png 用到），
+# 所以加它不增加下载；ZIP 的目录结构部分由 infra/zip.rs 自己读。
+flate2 = "1"
 # 环境信息（指纹派生）
 hostname = "0.4"
 whoami = "1"
