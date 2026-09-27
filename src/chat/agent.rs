@@ -722,7 +722,28 @@ fn execute_parallel(
         .collect()
 }
 
-/// 供 UI 拼接系统提示词文本
-pub fn build_system_text(system_prompt: &str, lang: Lang) -> String {
-    format!("{system_prompt}\n\n{}", build_tool_doc(lang))
+/// 供 UI 拼接系统提示词文本。
+///
+/// 工作目录必须写进来：模型看不到进程的 cwd，只能靠这段文字知道自己在哪个项目里，
+/// 否则它会在错误的目录下猜路径。
+///
+/// 放在**最后**是有意的：它每个会话都不同，而前面那段（提示词 + 工具说明）是所有
+/// 会话共用的。共用部分越靠前越完整，跨会话的上下文缓存才更容易命中。
+pub fn build_system_text(system_prompt: &str, cwd: &std::path::Path, lang: Lang) -> String {
+    let head = format!("{system_prompt}\n\n{}", build_tool_doc(lang));
+    let mark = match lang {
+        Lang::Zh => format!(
+            "## 当前工作目录\n{}\n\n\
+             所有相对路径都相对它；给工具的路径参数直接用相对路径即可。\n\
+             换目录操作前先把目标路径写清楚，不要猜。",
+            cwd.display()
+        ),
+        Lang::En => format!(
+            "## Current working directory\n{}\n\n\
+             All relative paths resolve against it; pass relative paths to tools.\n\
+             Before working elsewhere, state the target path explicitly instead of guessing.",
+            cwd.display()
+        ),
+    };
+    format!("{head}\n\n{mark}")
 }

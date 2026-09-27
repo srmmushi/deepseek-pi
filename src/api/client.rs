@@ -793,6 +793,34 @@ impl DeepSeekClient {
             .filter(|s| !s.is_empty())
     }
 
+    /// 网页端的会话清单：`(会话 id, 标题)`，接口本身就按最近更新排好序了。
+    ///
+    /// 与取单个标题同一条路（GET + 原始通道，见 `session_page`）。
+    /// 失败时把原因带出来，不静默吞掉 —— 这个接口踩过「用 POST 打 GET」的坑，
+    /// 出问题时必须能一眼分辨是状态码不对还是形状不对。
+    pub fn web_sessions(&self, token: &str) -> Result<Vec<(String, String)>, String> {
+        let data = self.session_page(token, &[("count", "100")])?;
+        let list = session_list(&data).ok_or_else(|| "返回里找不到会话数组".to_string())?;
+        let out: Vec<(String, String)> = list
+            .iter()
+            .filter_map(|s| {
+                let id = pick_id(s)?.to_string();
+                let title = s
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                Some((id, title))
+            })
+            .collect();
+        if out.is_empty() {
+            Err("会话数组是空的".to_string())
+        } else {
+            Ok(out)
+        }
+    }
+
     /// 调试用：会话列表接口的**原始响应体**（带状态码，按 `max_chars` 截断）。
     ///
     /// `/session debug` 与 `--dump-session` 打印它 ——
@@ -924,18 +952,21 @@ fn session_list(data: &Value) -> Option<&Vec<Value>> {
     None
 }
 
-/// 在列表里按 id 找标题。
+/// 从列表项里取会话 id。
 ///
 /// 键名多试几个：网页端的会话 id 是 UUID（形如
 /// `4ae00872-12d9-4427-8c1c-8600827d06cd`，就是 `/a/chat/s/<id>` 里那一段），
 /// 而它在不同接口里可能叫 id / session_id / conversation_id / chat_session_id。
+fn pick_id(s: &Value) -> Option<&str> {
+    ["id", "session_id", "conversation_id", "chat_session_id"]
+        .iter()
+        .find_map(|k| s.get(*k).and_then(|v| v.as_str()))
+}
+
+/// 在列表里按 id 找标题。
 fn pick_title(list: &[Value], session_id: &str) -> Option<String> {
     list.iter()
-        .find(|s| {
-            ["id", "session_id", "conversation_id", "chat_session_id"]
-                .iter()
-                .any(|k| s.get(*k).and_then(|v| v.as_str()) == Some(session_id))
-        })
+        .find(|s| pick_id(s) == Some(session_id))
         .and_then(|s| s.get("title").and_then(|v| v.as_str()))
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())

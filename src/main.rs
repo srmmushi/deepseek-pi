@@ -39,7 +39,7 @@ DSP (deepseek-pi) —— 终端编程助手，仅使用 DeepSeek 网页版
 
 选项
   -c, --config-dir <path>   配置目录（默认 ~/.pi/agent，也可用 PI_CONFIG_DIR）
-      --resume              接着最近一次会话继续
+      --resume              接着最近一次会话继续（默认是接着「本目录上一次」的会话）
       --selftest            只做自检：打印机器指纹并尝试解密已保存的凭证
       --info                只打印环境信息（同 /info）后退出，不进界面
       --dump-session        打印会话绑定诊断（网页会话 id、按 id 查标题的结果、
@@ -66,7 +66,9 @@ DSP (deepseek-pi) —— 终端编程助手，仅使用 DeepSeek 网页版
   /new               新建会话（清空上下文）
   /session           列出当前目录的会话
   /session all       列出全部会话（附路径，按终端宽度收窄）
-  /session <序号>    进入该会话：清屏并回放全部上下文（含思考）
+  /session <序号>    进入该会话：清屏并回放全部上下文（含思考），同时切到它的工作目录
+  /session web       列出本工具建过的网页会话（带工作目录）；
+  /session web <序号> 进入该会话并把工作目录切过去
   /session debug     诊断网页会话绑定（会话名取不回来时用它）
   /export            把本次会话导出成 Markdown（写在当前目录）
 
@@ -328,16 +330,19 @@ impl Core {
         Ok(self.client.clone().unwrap())
     }
 
-    /// 系统提示词 + 工具说明。同一会话内保持不变（见字段注释）。
+    /// 系统提示词 + 工具说明 + 当前工作目录。同一会话内保持不变（见字段注释）。
     fn system_text(&mut self) -> String {
-        let session_id = self.session.lock().unwrap().id.clone();
+        let (session_id, cwd) = {
+            let s = self.session.lock().unwrap();
+            (s.id.clone(), s.cwd.clone())
+        };
         if let Some((cached, text)) = &self.system_text_cache {
             if *cached == session_id {
                 return text.clone();
             }
         }
         let prompt = prompt::load_system_prompt(&self.paths, self.lang);
-        let text = agent::build_system_text(&prompt, self.lang);
+        let text = agent::build_system_text(&prompt, &cwd, self.lang);
         self.system_text_cache = Some((session_id, text.clone()));
         text
     }
@@ -493,10 +498,16 @@ fn run(paths: ConfigPaths, resume: bool) -> anyhow::Result<()> {
     let _ = config::ensure_models_file(&paths);
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    // 默认接着「本目录上一次的会话」继续 —— 会话是按目录存的，进同一个项目
+    // 就该看到同一份上下文，否则每次启动都像「存不下来」。
+    // 要开新的用 /new；要跨目录接最近一次，用 --resume。
     let session = if resume {
         Session::latest(&paths.sessions_dir).unwrap_or_else(|| Session::new(cwd.clone(), "新会话"))
     } else {
-        Session::new(cwd, "新会话")
+        Session::list(&paths.sessions_dir)
+            .into_iter()
+            .find(|s| s.cwd == cwd)
+            .unwrap_or_else(|| Session::new(cwd, "新会话"))
     };
     let token = auth::load_auth(&paths).map(|d| d.token);
 
@@ -994,6 +1005,88 @@ fn command(
                         }
                     },
                 }
+            } else if arg.eq_ignore_ascii_case("web")
+                || arg.to_ascii_lowercase().starts_with("web ")
+            {
+                // 网页端有哪些会话，其中哪些是本工具建的
+                // （本工具建的才会带系统提示词，也才知道它当时的工作目录）
+                let Some(token) = core.token.clone() else {
+                    app.line_styled("未登录，先 /login。", ui::warn());
+                    return;
+                };
+                let client = match core.client() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        app.line_styled(e, ui::err());
+                        return;
+                    }
+                };
+                let list = match client.web_sessions(&token) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        app.line_styled(format!("查网页端会话失败：{e}"), ui::err());
+                        return;
+                    }
+                };
+
+                let local = Session::list(&core.paths.sessions_dir);
+                let mut shown: Vec<Session> = Vec::new();
+                for (id, title) in &list {
+                    if let Some(s) = local
+                        .iter()
+                        .find(|s| s.handle.session_id.as_deref() == Some(id.as_str()))
+                    {
+                        let mut s = s.clone();
+                        // 网页端的名字是模型起的好名字，以它为准
+                        if !title.trim().is_empty() {
+                            s.title = title.clone();
+                        }
+                        shown.push(s);
+                    }
+                }
+
+                if shown.is_empty() {
+                    app.line_styled(
+                        format!(
+                            "网页端共 {} 个会话，但没有一个来自本工具（不带系统提示词，无法在此续接）。",
+                            list.len()
+                        ),
+                        ui::dim(),
+                    );
+                    return;
+                }
+
+                let width = crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(80);
+                app.line_styled(
+                    format!(
+                        "本工具建的网页会话（{}）· 网页端共 {} 个",
+                        shown.len(),
+                        list.len()
+                    ),
+                    ui::user_style(),
+                );
+                for (i, s) in shown.iter().enumerate() {
+                    let dir = ui::shorten_path(&s.cwd.display().to_string(), width / 3);
+                    app.line(format!("  #{:<3}{:<22}{dir}", i + 1, truncate(&s.title, 20)));
+                }
+
+                let pick = arg
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|n| n.trim_start_matches('#').parse::<usize>().ok());
+                match pick {
+                    None => app.line_styled(
+                        "/session web <序号> 进入：会话连同它的工作目录一起切过去。",
+                        ui::dim(),
+                    ),
+                    Some(n) if n < 1 || n > shown.len() => {
+                        app.line_styled("序号超出范围。", ui::warn())
+                    }
+                    Some(n) => {
+                        let chosen = shown[n - 1].clone();
+                        enter_session(core, app, chosen);
+                    }
+                }
             } else {
                 let index = match arg.trim_start_matches('#').parse::<usize>() {
                     Ok(n) if n >= 1 && n <= mine.len() => n - 1,
@@ -1002,28 +1095,7 @@ fn command(
                         return;
                     }
                 };
-                let picked = mine[index].clone();
-                // 思考只用于回放，不算进「几条上下文」
-                let count = picked
-                    .messages
-                    .iter()
-                    .filter(|(role, _)| role != "think")
-                    .count();
-                core.session_title = picked.title.clone();
-                *core.session.lock().unwrap() = picked.clone();
-                core.total_tokens = 0;
-                core.last_rate = None;
-                // 清屏并完整回放：不再只给一行「载入 N 条上下文」
-                app.clear_all();
-                app.line_styled(
-                    format!("❯ 已进入「{}」（{count} 条上下文）", core.session_title),
-                    ui::user_style(),
-                );
-                for (role, content) in &picked.messages {
-                    app.replay(role, content);
-                }
-                app.line("");
-                app.set_status(core.status_text());
+                enter_session(core, app, mine[index].clone());
             }
         }
         "/export" => {
@@ -1408,6 +1480,38 @@ fn export_markdown(session: &Session, path: &std::path::Path) -> std::io::Result
         out.push_str(&format!("## {who}\n\n{content}\n\n"));
     }
     std::fs::write(path, out)
+}
+
+/// 进入一个会话：换会话、清屏、完整回放（含可展开的思考）。
+///
+/// 抽出来是因为两条路径都要用：`/session <序号>` 与 `/session web <序号>`。
+/// 注意它同时切了**工作目录** —— 工具用的 cwd 取自会话本身，所以换会话即换目录。
+fn enter_session(core: &mut Core, app: &mut App, picked: Session) {
+    // 思考只用于回放，不算进「几条上下文」
+    let count = picked
+        .messages
+        .iter()
+        .filter(|(role, _)| role != "think")
+        .count();
+    core.session_title = picked.title.clone();
+    *core.session.lock().unwrap() = picked.clone();
+    core.total_tokens = 0;
+    core.last_rate = None;
+    // 清屏并完整回放：不再只给一行「载入 N 条上下文」
+    app.clear_all();
+    app.line_styled(
+        format!(
+            "❯ 已进入「{}」（{count} 条上下文）· 工作目录 {}",
+            core.session_title,
+            picked.cwd.display()
+        ),
+        ui::user_style(),
+    );
+    for (role, content) in &picked.messages {
+        app.replay(role, content);
+    }
+    app.line("");
+    app.set_status(core.status_text());
 }
 
 /// 用选定的浏览器打开一个网址。
