@@ -243,9 +243,19 @@ GET  open.weixin.qq.com/connect/qrcode/<编号>      ← 微信直接返回二�
 
 ```bash
 dsp install my-plugin.zip     # 装在配置目录下；同名覆盖 = 升级
-dsp plugins                   # 列出（界面里是 /plugins）
+dsp plugins                   # 列出：[开]/[关] + 版本号 + 描述
 dsp uninstall my-plugin       # 卸载
 ```
+
+开关（关掉的插件不参与系统提示词）：
+
+```bash
+dsp plugins my-plugin disable   # 关掉；也收 dsp plugins disable my-plugin
+dsp plugins my-plugin enable    # 打开
+```
+
+界面里是同一套：`/plugins` · `/plugins my-plugin disable` · `/plugins my-plugin enable`。
+两条路共用 `plugins::apply` 一份解析与文案，不会出现「命令行能跑、界面里另一套说法」。
 
 包结构 —— `plugin.json` 放包根，或者整体套一层目录都行：
 
@@ -265,6 +275,27 @@ my-plugin/
 
 > 解压不依赖系统里的 `unzip`，也没多拉 zip 库：`infra/zip.rs` 自己读中央目录，
 > 支持存储与 deflate 两种（deflate 借 `flate2`，它本来就在依赖树里 —— `image` 解 png 用到）。
+
+## 撤销：`/undo`
+
+借鉴 Aider 的 `/undo` —— 它的回退单位是「一次改动批次」而不是单个文件，
+那才符合「模型这一轮改砸了」的实际情况。这里不依赖 git：`write` / `edit`
+**落盘之前**，先把目标文件当前内容复制到 `<配置目录>/undo/<会话 id>/`。
+
+```text
+/undo        退掉最后一轮碰过的全部文件（恢复成那一轮动手之前的样子）
+/undo all    退掉本会话记录到的全部改动（每个文件回到会话开始时的样子）
+```
+
+要点：
+
+- **每次动手都留一份底**。只留第一次是不够的 —— 文件第一轮改过、第二轮又改了，
+  退第二轮时它也得跟着回去；这恰恰是最需要退的情况（这个坑是单元测试抓出来的）；
+- 恢复是**倒序**执行的，同一文件在一轮里被改多次也能落回正确状态；
+- 只覆盖 `write` / `edit`。`exec` 里跑的 `rm`、`git checkout`、构建产物之类管不到 ——
+  报错信息与 HELP 里都写明了，不含糊；
+- 账本按**会话**存（换会话换一本）。`<配置目录>/undo/` 下的目录可以随时删，
+  删了只是退不回去，不影响别的。
 
 ## 会话存储
 

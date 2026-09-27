@@ -5,4 +5,5 @@ pub mod browser;
 pub mod clipboard;
 pub mod config;
 pub mod plugins;
+pub mod undo;
 pub mod zip;

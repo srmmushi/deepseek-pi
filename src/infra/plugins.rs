@@ -11,7 +11,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::config::ConfigPaths;
+use crate::config::{AppConfig, ConfigPaths};
 use crate::infra::zip;
 
 /// 装好的一个插件
@@ -149,12 +149,13 @@ pub fn uninstall(paths: &ConfigPaths, name: &str) -> Result<String, String> {
     Ok(name)
 }
 
-/// 各插件贡献的系统提示词片段：`(插件名, 内容)`。
+/// 各插件贡献的系统提示词片段：`(插件名, 内容)`。关掉的插件不算。
 ///
-/// 读不出来或空文件跳过 —— 那种插件在 `list` 里已经标了 problem，够显眼了。
-pub fn prompt_additions(paths: &ConfigPaths) -> Vec<(String, String)> {
+/// 读不出来或空文件跳过 —— 那种插件在 `report` 里已经标了问题，够显眼了。
+pub fn prompt_additions(paths: &ConfigPaths, config: &AppConfig) -> Vec<(String, String)> {
     list(paths)
         .into_iter()
+        .filter(|p| !is_disabled(config, &p.name))
         .filter_map(|p| {
             let text = std::fs::read_to_string(p.prompt?).ok()?;
             let text = text.trim().to_string();
@@ -163,9 +164,109 @@ pub fn prompt_additions(paths: &ConfigPaths) -> Vec<(String, String)> {
         .collect()
 }
 
-/// 列表文本。CLI（`dsp plugins`）与界面（`/plugins`）共用一份格式，
-/// 免得两处说法不一致 —— 和 `sysinfo::report` 是同一个路子。
-pub fn report(paths: &ConfigPaths) -> Vec<String> {
+/// 这个插件被关掉了吗
+pub fn is_disabled(config: &AppConfig, name: &str) -> bool {
+    config
+        .disabled_plugins
+        .iter()
+        .any(|n| n.eq_ignore_ascii_case(name))
+}
+
+/// 开 / 关一个插件。名字没装过就直接说，不动配置。
+fn set_enabled(
+    paths: &ConfigPaths,
+    config: &mut AppConfig,
+    name: &str,
+    on: bool,
+) -> Result<Vec<String>, String> {
+    let name = sanitize_name(name).ok_or("插件名不合法")?;
+    if !list(paths)
+        .iter()
+        .any(|p| p.name.eq_ignore_ascii_case(&name))
+    {
+        return Err(format!("没有装过插件「{name}」（/plugins 看列表）"));
+    }
+    config.disabled_plugins.retain(|n| !n.eq_ignore_ascii_case(&name));
+    if !on {
+        config.disabled_plugins.push(name.clone());
+    }
+    Ok(vec![
+        format!("插件 {name} 已{}", if on { "开启" } else { "关闭" }),
+        "下次启动（或 /new 之后）生效 —— 同一会话的系统提示词前缀是冻结的".to_string(),
+    ])
+}
+
+/// CLI（`dsp plugins …`）与界面（`/plugins …`）**共用**的入口。
+///
+/// 两处都走它，是为了不让命令行和界面各说一套话、各写一套解析 ——
+/// 这也是这一版整理代码时合并掉的主要重复。返回要显示的行。
+pub fn apply(
+    paths: &ConfigPaths,
+    config: &mut AppConfig,
+    line: &str,
+) -> Result<Vec<String>, String> {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let cmd = words.first().copied().unwrap_or("");
+    let is_on = |w: &str| w.eq_ignore_ascii_case("enable") || w.eq_ignore_ascii_case("on");
+    let is_off = |w: &str| w.eq_ignore_ascii_case("disable") || w.eq_ignore_ascii_case("off");
+
+    // 开关收两种语序：`<名字> enable` 与 `enable <名字>`
+    if is_on(cmd) || is_off(cmd) {
+        let name = words
+            .get(1)
+            .copied()
+            .ok_or("用法：/plugins <名字> enable|disable")?;
+        return set_enabled(paths, config, name, is_on(cmd));
+    }
+    if words.len() >= 2 && (is_on(words[1]) || is_off(words[1])) {
+        return set_enabled(paths, config, words[0], is_on(words[1]));
+    }
+
+    match cmd {
+        // 路径可能带空格，所以剩下的整串当参数（不按词切）
+        "install" => {
+            let arg = line
+                .trim_start_matches(|c: char| c.is_whitespace())
+                .strip_prefix("install")
+                .unwrap_or("")
+                .trim();
+            if arg.is_empty() {
+                return Err("用法：/plugins install <插件包.zip>".to_string());
+            }
+            let p = install(paths, std::path::Path::new(arg))?;
+            let ver = if p.version.is_empty() {
+                "——".to_string()
+            } else {
+                p.version.clone()
+            };
+            let mut out = vec![format!("已安装插件 {} v{ver}", p.name)];
+            if !p.description.is_empty() {
+                out.push(format!("  {}", p.description));
+            }
+            out.push(format!("  装在 {}", p.dir.display()));
+            out.push(match &p.prompt {
+                Some(f) => format!(
+                    "  提示词 {} —— 下次启动（或 /new 之后）追加进系统提示词",
+                    f.file_name().unwrap_or_default().to_string_lossy()
+                ),
+                None => "  包里没有 prompt.md，装上但不会改变行为".to_string(),
+            });
+            Ok(out)
+        }
+        "uninstall" | "remove" => {
+            let name = words.get(1).copied().ok_or("用法：/plugins uninstall <名字>")?;
+            Ok(vec![format!("已卸载插件 {}", uninstall(paths, name)?)])
+        }
+        "" => Ok(report(paths, config)),
+        other => Err(format!(
+            "不认识「{other}」。可用：/plugins · <名字> enable|disable · install <包.zip> · uninstall <名字>"
+        )),
+    }
+}
+
+/// 列表文本：**开关状态 + 名字 + 版本号 + 描述**。
+/// CLI（`dsp plugins`）与界面（`/plugins`）共用这一份，免得两处说法不一致。
+pub fn report(paths: &ConfigPaths, config: &AppConfig) -> Vec<String> {
     let dir = plugins_dir(paths);
     let items = list(paths);
     if items.is_empty() {
@@ -174,29 +275,45 @@ pub fn report(paths: &ConfigPaths) -> Vec<String> {
             "装一个：dsp install <插件包.zip>".to_string(),
         ];
     }
-    let mut out = vec![format!("已装插件 {}（目录 {}）", items.len(), dir.display())];
+    let mut out = vec![format!(
+        "已装插件 {}（目录 {}）",
+        items.len(),
+        dir.display()
+    )];
     for p in items {
+        let on = !is_disabled(config, &p.name);
         let ver = if p.version.is_empty() {
-            String::new()
+            "——".to_string()
         } else {
-            format!(" v{}", p.version)
+            p.version.clone()
         };
-        let warn = if p.problem.is_some() { "  ⚠" } else { "" };
-        out.push(format!("  {}{ver}{warn}", p.name));
+        let warn = if p.problem.is_some() { " ⚠" } else { "" };
+        out.push(format!(
+            "  [{}] {:<22} v{:<10}{warn}",
+            if on { "开" } else { "关" },
+            p.name,
+            ver
+        ));
         if !p.description.is_empty() {
-            out.push(format!("      {}", p.description));
+            out.push(format!("         {}", p.description));
+        }
+        if p.prompt.is_some() && !on {
+            out.push("         （已关闭：不参与系统提示词）".to_string());
         }
         if let Some(pr) = &p.prompt {
-            out.push(format!(
-                "      提示词 {}",
-                pr.file_name().unwrap_or_default().to_string_lossy()
-            ));
+            if on {
+                out.push(format!(
+                    "         提示词 {}",
+                    pr.file_name().unwrap_or_default().to_string_lossy()
+                ));
+            }
         }
         if let Some(prob) = &p.problem {
-            out.push(format!("      问题：{prob}"));
+            out.push(format!("         问题：{prob}"));
         }
     }
-    out.push("插件提示词在下次启动（或 /new 之后）生效。".to_string());
+    out.push("开关：/plugins <名字> enable|disable（dsp plugins 同理）".to_string());
+    out.push("改动在下次启动（或 /new 之后）生效。".to_string());
     out
 }
 

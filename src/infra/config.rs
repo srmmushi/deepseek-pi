@@ -172,6 +172,10 @@ pub struct AppConfig {
     /// 空 = 还没生成，第一登录时随机生成并落盘。
     #[serde(rename = "deviceId")]
     pub device_id: String,
+    /// 被关掉的插件名（`/plugins <名字> disable`）。
+    /// 存名字而不是布尔量：插件目录随时可能被删，配置里留一堆失效开关没意义。
+    #[serde(rename = "disabledPlugins")]
+    pub disabled_plugins: Vec<String>,
 }
 
 /// 默认 PoW WASM 地址（上游更新静态资源后需替换）
@@ -199,6 +203,7 @@ impl Default for AppConfig {
             context_mode: ContextMode::Reuse,
             browser: String::new(),
             device_id: String::new(),
+            disabled_plugins: Vec::new(),
         }
     }
 }

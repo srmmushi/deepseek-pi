@@ -239,6 +239,8 @@ pub struct AgentRuntime {
     pub lang: Lang,
     /// 中断标志
     pub aborted: Arc<Mutex<bool>>,
+    /// 改动账本（`/undo`）。工具是并行跑的，留底必须串行，所以整体在锁里
+    pub undo: Arc<Mutex<crate::undo::Undo>>,
 }
 
 /// 一轮流式过程中累积的状态
@@ -365,6 +367,10 @@ pub fn run_turn(
     tx: &Sender<UiEvent>,
 ) {
     let lang = runtime.lang;
+    // 新的一轮：`/undo` 以「轮」为单位回退，所以先记账
+    if let Ok(mut u) = runtime.undo.lock() {
+        u.begin_turn();
+    }
     let turn_started = std::time::Instant::now();
     let mut total_usage: u64 = 0;
     let mut saw_usage = false;
@@ -609,7 +615,7 @@ pub fn run_turn(
         ));
         let parallel = calls.len() > 1;
         let cwd = session.cwd.clone();
-        let results = execute_parallel(calls.clone(), cwd, lang);
+        let results = execute_parallel(calls.clone(), cwd, lang, runtime.undo.clone());
 
         let mut blocks: Vec<String> = Vec::new();
         let batch_started = std::time::Instant::now();
@@ -699,12 +705,20 @@ fn execute_parallel(
     calls: Vec<ToolCall>,
     cwd: PathBuf,
     lang: Lang,
+    undo: Arc<Mutex<crate::undo::Undo>>,
 ) -> Vec<(ToolCall, ToolResult, u128)> {
     let mut handles = Vec::new();
     for call in calls {
         let cwd = cwd.clone();
+        let undo = undo.clone();
         handles.push(std::thread::spawn(move || {
             let started = std::time::Instant::now();
+            // 落盘**之前**留底：这是 `/undo` 的唯一依据，错过就补不回来了
+            if let Some(abs) = crate::tools::touched_file(&call, &cwd) {
+                if let Ok(mut u) = undo.lock() {
+                    let _ = u.snapshot(&abs);
+                }
+            }
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 execute_tool(&call, &cwd, lang)
             }))

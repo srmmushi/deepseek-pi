@@ -8,7 +8,7 @@ pub(crate) mod tui;
 
 pub(crate) use api::{client as deepseek, stream};
 pub(crate) use chat::{agent, prompt, tools};
-pub(crate) use infra::{auth, browser, clipboard, config, plugins};
+pub(crate) use infra::{auth, browser, clipboard, config, plugins, undo};
 pub(crate) use tui::{app as ui, i18n, sysinfo};
 
 use std::io::Stdout;
@@ -61,7 +61,7 @@ DSP (deepseek-pi) —— 终端编程助手，仅使用 DeepSeek 网页版
 
 命令
   /help /login /logout /new /session /clear /goto /thinking /search
-  /model /lang /status /info /open /export /plugins /system-prompt /quit
+  /model /lang /status /info /open /export /plugins /undo /system-prompt /quit
 
 会话
   /new               新建会话（清空上下文）
@@ -72,6 +72,9 @@ DSP (deepseek-pi) —— 终端编程助手，仅使用 DeepSeek 网页版
   /session web <序号> 进入该会话并把工作目录切过去
   /session debug     诊断网页会话绑定（会话名取不回来时用它）
   /export            把本次会话导出成 Markdown（写在当前目录）
+  /undo              回退最后一轮对文件的改动；/undo all 退回本会话全部改动
+                     只覆盖 write / edit —— 它们动手前会把原文件留底；
+                     exec 里跑的命令（rm、git checkout 之类）管不到
 
 插件
   dsp install <包.zip>     装到 <配置目录>/plugins/<名字>/（同名覆盖 = 升级）
@@ -365,7 +368,7 @@ impl Core {
         let mut text = agent::build_system_text(&prompt, &cwd, self.lang);
         // 插件的提示词追加在**最末尾**：它每个会话都一样，所以不会打乱前面
         // 那段所有会话共用的前缀（缓存照样命中），同时插件能扩展行为。
-        for (name, body) in plugins::prompt_additions(&self.paths) {
+        for (name, body) in plugins::prompt_additions(&self.paths, &self.config) {
             text.push_str(&format!("\n\n## 插件：{name}\n{body}"));
         }
         self.system_text_cache = Some((session_id, text.clone()));
@@ -462,69 +465,27 @@ fn dump_turn(paths: &ConfigPaths) {
 /// 装在 `<配置目录>/plugins/<名字>/`。不进界面、直接打印结果 ——
 /// 与那几个 `--dump-*` 诊断开关同一个路子：好复制，出错也好贴出来。
 fn plugin_cli(paths: &ConfigPaths, line: &str) -> i32 {
-    let mut it = line.split_whitespace();
-    let cmd = it.next().unwrap_or("plugins");
-    let rest: Vec<&str> = it.collect();
-    let arg = rest.join(" ");
-    let arg = arg.trim();
-
-    match cmd {
-        "install" => {
-            if arg.is_empty() {
-                println!("用法：dsp install <插件包.zip>");
-                return 2;
+    // 开关状态存在配置里，所以要先读出来；成功后写回。
+    // 解析与文案全在 plugins::apply —— 与界面里的 /plugins 完全同一份。
+    let line = line.trim();
+    let line = line
+        .strip_prefix("plugins")
+        .or_else(|| line.strip_prefix("list"))
+        .unwrap_or(line)
+        .trim();
+    let mut config = config::load_config(paths);
+    match plugins::apply(paths, &mut config, line) {
+        Ok(lines) => {
+            if config::save_config(paths, &config).is_err() {
+                println!("（配置写入失败：开关状态可能没存住）");
             }
-            match plugins::install(paths, std::path::Path::new(arg)) {
-                Err(e) => {
-                    println!("安装失败：{e}");
-                    1
-                }
-                Ok(p) => {
-                    let ver = if p.version.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" v{}", p.version)
-                    };
-                    println!("已安装插件 {}{ver}", p.name);
-                    if !p.description.is_empty() {
-                        println!("  {}", p.description);
-                    }
-                    println!("  装在 {}", p.dir.display());
-                    match &p.prompt {
-                        Some(f) => println!(
-                            "  提示词 {} —— 下次启动（或 /new 之后）追加进系统提示词",
-                            f.file_name().unwrap_or_default().to_string_lossy()
-                        ),
-                        None => println!("  包里没有 prompt.md，装上但不会改变行为"),
-                    }
-                    0
-                }
-            }
-        }
-        "uninstall" | "remove" => {
-            if arg.is_empty() {
-                println!("用法：dsp uninstall <插件名>");
-                return 2;
-            }
-            match plugins::uninstall(paths, arg) {
-                Ok(n) => {
-                    println!("已卸载插件 {n}");
-                    0
-                }
-                Err(e) => {
-                    println!("卸载失败：{e}");
-                    1
-                }
-            }
-        }
-        "plugins" | "list" => {
-            for l in plugins::report(paths) {
+            for l in lines {
                 println!("{l}");
             }
             0
         }
-        other => {
-            println!("未知子命令「{other}」。可用：install / uninstall / plugins");
+        Err(e) => {
+            println!("{e}");
             2
         }
     }
@@ -878,6 +839,12 @@ fn start_turn(core: &mut Core, app: &mut App, input: String, rx: &mut Option<Rec
     let (tx, receiver): (Sender<UiEvent>, Receiver<UiEvent>) = mpsc::channel();
     *rx = Some(receiver);
 
+    // 改动账本按**会话**存：换会话就换一本，/undo 只退当前会话动过的文件
+    let undo_dir = core
+        .paths
+        .config_dir
+        .join("undo")
+        .join(core.session.lock().unwrap().id.clone());
     let runtime = AgentRuntime {
         client,
         solver: core.solver.clone(),
@@ -885,6 +852,7 @@ fn start_turn(core: &mut Core, app: &mut App, input: String, rx: &mut Option<Rec
         config: core.config.clone(),
         lang: core.lang,
         aborted: core.aborted.clone(),
+        undo: std::sync::Arc::new(std::sync::Mutex::new(undo::Undo::open(undo_dir))),
     };
     let system_text = core.system_text();
     let session = core.session.clone();
@@ -995,42 +963,52 @@ fn command(
             app.set_status(core.status_text());
             app.line_styled(tr(next, "cmd.langSet"), ui::dim());
         }
-        // /plugins           列出装好的插件（安装/卸载在终端里用 dsp install）
-        // /plugins install <包.zip>  装一个（等价于 dsp install）
-        // /plugins uninstall <名字>  卸载
+        // /plugins                      列出：开关状态 / 版本号 / 描述
+        // /plugins <名字> enable|disable  开或关（两种语序都收）
+        // /plugins install <包.zip>       装（等价于 dsp install）
+        // /plugins uninstall <名字>       卸
         "/plugins" => {
-            let mut it = arg.split_whitespace();
-            let sub = it.next().unwrap_or("");
-            let rest: Vec<&str> = it.collect();
-            let rest = rest.join(" ");
-            match sub {
-                "" => {
-                    for line in plugins::report(&core.paths) {
-                        app.line(line);
+            // 与 `dsp plugins …` 走同一份解析与文案，界面这边只负责显示
+            match plugins::apply(&core.paths, &mut core.config, &arg) {
+                Ok(lines) => {
+                    core.persist();
+                    for l in lines {
+                        app.line(l);
                     }
                 }
-                "install" if !rest.trim().is_empty() => {
-                    match plugins::install(&core.paths, std::path::Path::new(rest.trim())) {
-                        Ok(p) => app.line_styled(
-                            format!(
-                                "已安装插件 {} —— /new 之后它的提示词会追加进系统提示词",
-                                p.name
-                            ),
-                            ui::ok(),
-                        ),
-                        Err(e) => app.line_styled(format!("安装失败：{e}"), ui::err()),
-                    }
-                }
-                "uninstall" | "remove" if !rest.trim().is_empty() => {
-                    match plugins::uninstall(&core.paths, rest.trim()) {
-                        Ok(n) => app.line_styled(format!("已卸载插件 {n}"), ui::ok()),
-                        Err(e) => app.line_styled(format!("卸载失败：{e}"), ui::err()),
-                    }
-                }
-                _ => app.line_styled(
-                    "用法：/plugins 列出 · /plugins install <包.zip> · /plugins uninstall <名字>",
-                    ui::dim(),
+                Err(e) => app.line_styled(e, ui::warn()),
+            }
+        }
+        // /undo              回退**最后一轮**对文件做的改动（write / edit 动手前留的底）
+        // /undo all          回退本会话记录到的全部文件改动
+        "/undo" => {
+            let dir = core
+                .paths
+                .config_dir
+                .join("undo")
+                .join(core.session.lock().unwrap().id.clone());
+            let mut u = undo::Undo::open(dir);
+            let all = arg.eq_ignore_ascii_case("all");
+            let files = u.last_turn_files();
+            let result = if all { u.revert_all() } else { u.revert_last() };
+            match result {
+                Err(e) => app.line_styled(
+                    format!("{e}（/undo 只管 write / edit 改的文件，exec 里跑的命令管不到）"),
+                    ui::warn(),
                 ),
+                Ok(lines) => {
+                    app.line_styled(
+                        if all {
+                            format!("已回退本会话记录到的全部文件改动（{} 个文件）", lines.len())
+                        } else {
+                            format!("已回退最后一轮（{} 个文件）", files.len())
+                        },
+                        ui::ok(),
+                    );
+                    for l in lines {
+                        app.line(format!("  {l}"));
+                    }
+                }
             }
         }
         "/status" => {

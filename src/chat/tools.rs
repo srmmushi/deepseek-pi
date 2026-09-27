@@ -937,6 +937,15 @@ fn run_edit(content: &str, path: &str, from: usize, to: usize, cwd: &Path) -> To
     }
 }
 
+/// 这个调用会不会改文件？会的话给出目标文件的绝对路径（`/undo` 留底用）。
+/// 只认 `write` / `edit` —— `exec` 里能干什么是猜不到的，那部分由用户自己负责。
+pub fn touched_file(call: &ToolCall, cwd: &Path) -> Option<PathBuf> {
+    match call {
+        ToolCall::Write { path, .. } | ToolCall::Edit { path, .. } => Some(to_absolute(cwd, path)),
+        _ => None,
+    }
+}
+
 /// 执行一个工具调用
 pub fn execute_tool(call: &ToolCall, cwd: &Path, lang: Lang) -> ToolResult {
     match call {
