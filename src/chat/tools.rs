@@ -472,6 +472,101 @@ mod tests {
         assert!(calls("我先 read:src/a.rs 看看").is_empty());
         assert!(calls("这不是一个调用").is_empty());
     }
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("dsp-tools-test-{tag}"));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// 单行编辑不能把整份文件的换行风格翻掉。
+    /// CRLF 项目里这是最常见的「只改一行，git 显示全文都改了」。
+    #[test]
+    fn edit_keeps_crlf_line_endings() {
+        let dir = tmpdir("edit-crlf");
+        let f = dir.join("a.txt");
+        std::fs::write(&f, "one\r\ntwo\r\nthree\r\n").unwrap();
+        let r = run_edit("TWO", "a.txt", 2, 2, &dir);
+        assert!(r.ok, "{}", r.output);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "one\r\nTWO\r\nthree\r\n");
+    }
+
+    /// 末尾追加（from = 0）同样跟随原风格
+    #[test]
+    fn append_keeps_crlf_line_endings() {
+        let dir = tmpdir("append-crlf");
+        let f = dir.join("a.txt");
+        std::fs::write(&f, "one\r\n").unwrap();
+        let r = run_edit("two", "a.txt", 0, 0, &dir);
+        assert!(r.ok, "{}", r.output);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "one\r\ntwo\r\n");
+    }
+
+    /// 反方向也要守住：LF 文件不许被改成 CRLF
+    #[test]
+    fn edit_keeps_lf_line_endings() {
+        let dir = tmpdir("edit-lf");
+        let f = dir.join("a.txt");
+        std::fs::write(&f, "one\ntwo\n").unwrap();
+        run_edit("TWO", "a.txt", 2, 2, &dir);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "one\nTWO\n");
+    }
+
+    /// write 覆盖已有 CRLF 文件时，跟随它的风格
+    #[test]
+    fn write_follows_existing_crlf() {
+        let dir = tmpdir("write-crlf");
+        let f = dir.join("a.txt");
+        std::fs::write(&f, "old\r\n").unwrap();
+        let r = run_write("new1\nnew2\n", "a.txt", &dir, Lang::Zh);
+        assert!(r.ok, "{}", r.output);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "new1\r\nnew2\r\n");
+    }
+
+    /// list 截断时要给**真实总数**，而且显示的是字母序前 N 个
+    /// （以前读够 500 个就停再排序，那 500 个是读目录的任意顺序）
+    #[test]
+    fn list_shows_alphabetical_prefix_with_true_total() {
+        let dir = tmpdir("list-many");
+        for i in 0..(MAX_LIST_ENTRIES + 20) {
+            std::fs::write(dir.join(format!("f{i:04}.txt")), "").unwrap();
+        }
+        let r = run_list(".", &dir, Lang::Zh);
+        assert!(r.ok, "{}", r.output);
+        assert!(
+            r.output.contains(&format!("共 {} 项", MAX_LIST_ENTRIES + 20)),
+            "{}",
+            r.output
+        );
+        assert!(r.output.contains("f0000.txt"), "字母序第一个应当在里面");
+        assert!(
+            r.output.contains(&format!("f{:04}.txt", MAX_LIST_ENTRIES - 1)),
+            "第 {MAX_LIST_ENTRIES} 个应当在里面"
+        );
+        assert!(
+            !r.output.contains(&format!("f{:04}.txt", MAX_LIST_ENTRIES + 1)),
+            "第 {} 个不该出现",
+            MAX_LIST_ENTRIES + 2
+        );
+    }
+
+    /// 搜索看过的东西不完整时必须说明 —— 否则「未找到」会被当成「不存在」
+    #[test]
+    fn search_reports_skipped_files() {
+        let dir = tmpdir("search-skip");
+        std::fs::write(dir.join("a.txt"), "hello world\n").unwrap();
+        // 含 NUL 的按二进制跳过
+        std::fs::write(dir.join("bin.dat"), [0u8, 1, 2, 3]).unwrap();
+
+        let r = run_search("hello", &dir, Lang::Zh);
+        assert!(r.output.contains("a.txt:1"), "{}", r.output);
+        assert!(r.output.contains("没能参与搜索"), "{}", r.output);
+
+        let r = run_search("这里根本没有的东西", &dir, Lang::Zh);
+        assert!(r.output.contains("未找到"), "{}", r.output);
+        assert!(r.output.contains("没能参与搜索"), "{}", r.output);
+    }
 }
 
 /// 工具调用的参数摘要（界面展示用）
@@ -526,6 +621,51 @@ fn to_absolute(cwd: &Path, p: &str) -> PathBuf {
     }
 }
 
+/// 文件的换行风格。
+///
+/// 改文件必须照原样写回去：`str::lines()` 会把 CRLF 的 `\r` 吃掉，若再用 `\n` 拼回去，
+/// 一次单行编辑就会把**整份文件**的行尾翻一遍 —— 在 git 上看着像重写了全文，
+/// 还会毁掉 `.bat` / `.ps1` / `.sln` 这类对行尾敏感的文件。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Eol {
+    Lf,
+    Crlf,
+}
+
+impl Eol {
+    fn as_str(self) -> &'static str {
+        match self {
+            Eol::Lf => "\n",
+            Eol::Crlf => "\r\n",
+        }
+    }
+}
+
+/// 出现 CRLF 就按 CRLF 处理（混用时以第一个出现的风格为准的简化：有 CRLF 就当 CRLF）
+fn detect_eol(text: &str) -> Eol {
+    if text.contains("\r\n") {
+        Eol::Crlf
+    } else {
+        Eol::Lf
+    }
+}
+
+/// 递归搜索时跳过的目录：构建产物、依赖、缓存 —— 搜它们只会淹没真正的结果。
+/// 按**不区分大小写**比较，因为 Windows 上 `Target`、`NODE_MODULES` 都可能出现。
+fn is_ignored_dir(name: &str) -> bool {
+    const IGNORED: [&str; 8] = [
+        "node_modules",
+        ".git",
+        "target",
+        "dist",
+        ".next",
+        "__pycache__",
+        ".venv",
+        "venv",
+    ];
+    IGNORED.iter().any(|d| d.eq_ignore_ascii_case(name))
+}
+
 fn display_path(cwd: &Path, abs: &Path) -> String {
     match abs.strip_prefix(cwd) {
         Ok(rel) if !rel.as_os_str().is_empty() => rel.to_string_lossy().replace('\\', "/"),
@@ -556,7 +696,15 @@ fn run_write(content: &str, path: &str, cwd: &Path, lang: Lang) -> ToolResult {
             };
         }
     }
-    match std::fs::write(&abs, content) {
+    // 覆盖已有文件时跟随它的换行风格：模型写的内容几乎总是 LF，
+    // 直接盖进 CRLF 的项目里，会让整份文件显示成「全都改了」。
+    let content: String = match std::fs::read_to_string(&abs) {
+        Ok(old) if detect_eol(&old) == Eol::Crlf && !content.contains("\r\n") => {
+            content.replace('\n', "\r\n")
+        }
+        _ => content.to_string(),
+    };
+    match std::fs::write(&abs, &content) {
         Ok(()) => {
             let bytes = content.len();
             ToolResult {
@@ -670,22 +818,35 @@ fn run_list(path: &str, cwd: &Path, lang: Lang) -> ToolResult {
             }
         }
     };
+    // 名字先尽量收全再排序、再截断。
+    // 以前是「读够 500 个就 break，然后排序」—— 那 500 个是 read_dir 的**任意顺序**，
+    // 模型拿到一份看不出规律的名字，很容易据此断定「某个文件不存在」。
+    // LIST_SCAN_LIMIT 只是防病态目录（几十万项），正常项目根本碰不到。
+    const LIST_SCAN_LIMIT: usize = 5000;
     let mut rows: Vec<String> = Vec::new();
+    let mut total = 0usize;
     for entry in entries.flatten() {
-        if rows.len() >= MAX_LIST_ENTRIES {
-            break;
+        total += 1;
+        if rows.len() >= LIST_SCAN_LIMIT {
+            continue;
         }
         let name = entry.file_name().to_string_lossy().to_string();
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
         rows.push(if is_dir { format!("{name}/") } else { name });
     }
     rows.sort();
-    let truncated = rows.len() >= MAX_LIST_ENTRIES;
-    let more = if truncated {
-        format!("\n（输出已截断，仅显示前 {MAX_LIST_ENTRIES} 项）")
+    let shown = rows.len().min(MAX_LIST_ENTRIES);
+    let more = if total > shown {
+        let collected = if total > rows.len() {
+            format!("；目录太大，只收集了前 {} 个名字", rows.len())
+        } else {
+            String::new()
+        };
+        format!("\n（共 {total} 项，按字母序显示前 {shown} 项{collected}）")
     } else {
         String::new()
     };
+    rows.truncate(shown);
     let shown = display_path(cwd, &abs);
     ToolResult {
         ok: true,
@@ -702,6 +863,9 @@ fn run_search(query: &str, cwd: &Path, lang: Lang) -> ToolResult {
     let needle = query.to_lowercase();
     let mut matches: Vec<String> = Vec::new();
     let mut scanned = 0usize;
+    // 跳过了多少「本该有内容但没能看」的东西。必须报出来：
+    // 否则一次只看了一半的搜索会以「未找到」收场，模型据此断定代码不存在。
+    let mut skipped = 0usize;
     let mut stack = vec![cwd.to_path_buf()];
 
     while let Some(dir) = stack.pop() {
@@ -709,6 +873,7 @@ fn run_search(query: &str, cwd: &Path, lang: Lang) -> ToolResult {
             break;
         }
         let Ok(entries) = std::fs::read_dir(&dir) else {
+            skipped += 1;
             continue;
         };
         for entry in entries.flatten() {
@@ -718,8 +883,7 @@ fn run_search(query: &str, cwd: &Path, lang: Lang) -> ToolResult {
             let path = entry.path();
             let Ok(file_type) = entry.file_type() else { continue };
             if file_type.is_dir() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if matches!(name.as_str(), "node_modules" | ".git" | "target" | "dist" | ".next") {
+                if is_ignored_dir(&entry.file_name().to_string_lossy()) {
                     continue;
                 }
                 stack.push(path);
@@ -729,12 +893,20 @@ fn run_search(query: &str, cwd: &Path, lang: Lang) -> ToolResult {
                 continue;
             }
             scanned += 1;
-            let Ok(meta) = entry.metadata() else { continue };
+            let Ok(meta) = entry.metadata() else {
+                skipped += 1;
+                continue;
+            };
             if meta.len() > MAX_SEARCH_FILE_BYTES {
+                skipped += 1;
                 continue;
             }
-            let Ok(bytes) = std::fs::read(&path) else { continue };
+            let Ok(bytes) = std::fs::read(&path) else {
+                skipped += 1;
+                continue;
+            };
             if bytes.contains(&0) {
+                skipped += 1;
                 continue;
             }
             let text = String::from_utf8_lossy(&bytes);
@@ -750,22 +922,36 @@ fn run_search(query: &str, cwd: &Path, lang: Lang) -> ToolResult {
         }
     }
 
+    // 跳过说明：只要看过的东西不完整就明确写出来 ——
+    //「没找到」和「没看全」是两回事，混在一起会把模型直接带向错误结论。
+    let note = if skipped > 0 {
+        format!(
+            "\n（另有 {skipped} 个文件或目录没能参与搜索：二进制、超过 {} 或读不了）",
+            format_bytes(MAX_SEARCH_FILE_BYTES)
+        )
+    } else {
+        String::new()
+    };
+
     if matches.is_empty() {
         return ToolResult {
             ok: true,
-            output: format!("未找到包含 \"{query}\" 的内容"),
+            output: format!("未找到包含 \"{query}\" 的内容{note}"),
             summary: format!("{query} · 无匹配"),
         };
     }
-    let truncated = matches.len() >= MAX_SEARCH_MATCHES;
+    // 触发上限也要说：以前只报「匹配数到顶」，文件数到顶时反而静默
+    let truncated = matches.len() >= MAX_SEARCH_MATCHES || scanned >= MAX_SEARCH_FILES;
     let tail = if truncated {
-        format!("\n（输出已截断，仅显示前 {MAX_SEARCH_MATCHES} 处）")
+        format!(
+            "\n（结果被截断：最多 {MAX_SEARCH_MATCHES} 处 / {MAX_SEARCH_FILES} 个文件；缩小搜索范围更可靠）"
+        )
     } else {
         String::new()
     };
     ToolResult {
         ok: true,
-        output: format!("[search] {query}\n{}{tail}", matches.join("\n")),
+        output: format!("[search] {query}\n{}{tail}{note}", matches.join("\n")),
         summary: format!(
             "{query} · {} {}",
             matches.len(),
@@ -856,7 +1042,14 @@ fn run_exec(command: &str, cwd: &Path, lang: Lang) -> ToolResult {
         Err(_) => ShellResult {
             ok: false,
             code: 124,
-            output: format!("命令超时（{EXEC_TIMEOUT_SECS}s）"),
+            // std 没有「超时后连子进程一起收掉」的能力（拿不到它的句柄），
+            // 所以只能停止等待。这一点必须说出来 —— 否则用户以为命令已经结束了。
+            output: format!(
+                "命令超时（{EXEC_TIMEOUT_SECS}s），已停止等待。\n\
+                 注意：那个子进程可能还在后台跑（比如卡住的构建或死循环的脚本），\
+                 需要的话自己结束它。\n\
+                 长命令建议拆小，或自己加上超时参数（例如 timeout 30s、cargo --offline）。"
+            ),
             duration_ms: EXEC_TIMEOUT_SECS as u128 * 1000,
         },
     };
@@ -892,7 +1085,9 @@ fn run_edit(content: &str, path: &str, from: usize, to: usize, cwd: &Path) -> To
             }
         }
     };
+    let eol = detect_eol(&text);
     let keep_trailing_newline = text.ends_with('\n');
+    // lines() 已经把 CRLF 里的 \r 吃掉了，所以拼回去时按原风格补（见 Eol 的注释）
     let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
     let total = lines.len();
     let new_lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
@@ -915,9 +1110,9 @@ fn run_edit(content: &str, path: &str, from: usize, to: usize, cwd: &Path) -> To
         format!("{from}-{to} 行")
     };
 
-    let mut out = lines.join("\n");
+    let mut out = lines.join(eol.as_str());
     if keep_trailing_newline {
-        out.push('\n');
+        out.push_str(eol.as_str());
     }
     if let Err(e) = std::fs::write(&abs, out) {
         return ToolResult {
